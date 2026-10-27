@@ -1,0 +1,1083 @@
+# UNIT 1: WINDOWS SECURITY (Windows 10/11)
+### Study Notes: Architecture, Identity & Access Control, Core Security Technologies
+
+> **Audience:** Security engineers and certification candidates (CISSP, OSCP, Windows security engineering tracks).
+> **Scope:** Windows 10 (22H2) and Windows 11 (22H2 – 24H2 era). Registry paths, GUIDs, and event IDs are given so each control can be verified on a live system. Features evolve between builds; always validate against current Microsoft documentation before production rollout.
+
+---
+
+## Table of Contents
+
+1. [Introduction to Windows Security Architecture](#1-introduction-to-windows-security-architecture)
+2. [Windows Identity, Authorization, and Access Control](#2-windows-identity-authorization-and-access-control)
+3. [Core Windows Security Technologies](#3-core-windows-security-technologies-windows-1011)
+4. [Layered Defense Summary & Hardening Checklist](#4-layered-defense-summary--hardening-checklist)
+5. [Quick Review Questions](#5-quick-review-questions)
+
+---
+
+# 1. Introduction to Windows Security Architecture
+
+## 1.1 Ring-Based Protection Model (Ring 3 vs. Ring 0)
+
+x86/x64 CPUs define four privilege levels ("rings") enforced in hardware via the Current Privilege Level (CPL) bits in the code segment register. Windows uses only two:
+
+| Ring | Name | Windows Usage | Examples |
+|------|------|---------------|----------|
+| **Ring 3** | User Mode | Applications, services, subsystem DLLs, user-mode drivers (UMDF) | `explorer.exe`, `chrome.exe`, `lsass.exe`, `csrss.exe`, `ntdll.dll` |
+| **Ring 0** | Kernel Mode | Executive, kernel, HAL, kernel-mode drivers, `win32k` | `ntoskrnl.exe`, `hal.dll`, `win32kfull.sys`, `ntfs.sys`, `tcpip.sys` |
+
+(Rings 1 and 2 are unused. Ring -1 is informal shorthand for the hypervisor, and Ring -2 for SMM/firmware. Both matter greatly for VBS in Section 3.)
+
+### User Mode
+- Each process has a **private virtual address space** (the lower half on x64; user range ends near `0x00007FFF'FFFFFFFF`).
+- Cannot execute privileged instructions (`CLI`, `LGDT`, `MOV CR3`, `WRMSR`, etc.) or touch kernel memory. A violation raises an access violation (`0xC0000005`) or general-protection fault.
+- Access to system resources (files, registry, memory, threads) is done only through **handles** to kernel objects, validated by the kernel on every call.
+- A crash is contained to the process.
+
+### Kernel Mode
+- All kernel-mode code shares **one single address space** (the upper half on x64). Any driver can read or write any kernel memory, so a bug or malicious driver means full system compromise. This is the reason for Driver Signature Enforcement, HVCI, and the vulnerable driver blocklist.
+- A fault causes a bugcheck (BSOD).
+
+### Transition Mechanisms (User → Kernel)
+
+| Mechanism | Description |
+|-----------|-------------|
+| **`SYSCALL` / `SYSRET`** (x64) | The modern fast path. User code in `ntdll.dll` loads the system service number into `EAX` and executes `syscall`. CPU jumps to the address in the `LSTAR` MSR, which points to `nt!KiSystemCall64`. `SYSENTER`/`SYSEXIT` is used in 32-bit. |
+| **`INT 0x2E`** | Legacy 32-bit software interrupt gate (still present for compatibility). |
+| **Hardware interrupts / exceptions** | The IDT routes them into kernel handlers (`KiPageFault`, ISRs). |
+| **ALPC / LPC** | Not a CPU transition, but a kernel-mediated IPC channel used between user-mode processes (for example, LSASS ↔ SRM, apps ↔ `csrss`). |
+
+**Typical syscall path:**
+
+```
+Application → kernel32!CreateFileW → kernelbase!CreateFileW
+            → ntdll!NtCreateFile  (stub: mov r10,rcx; mov eax,<SSN>; syscall)
+            → [Ring 0] nt!KiSystemCall64
+            → System Service Dispatch Table (KiServiceTable / SSDT) lookup by SSN
+            → nt!NtCreateFile → I/O Manager → Object Manager → SRM access check
+            → sysret back to Ring 3
+```
+
+Security-relevant details:
+- **Parameter validation / probing:** the kernel must never trust user pointers. It uses `ProbeForRead`/`ProbeForWrite` and SEH (`__try`/`__except`) when touching user buffers. Missing validation causes classic kernel privilege-escalation bugs (TOCTOU, arbitrary write).
+- **SMEP/SMAP:** CPU features that block the kernel from executing (SMEP) or accessing (SMAP) user-mode pages, mitigating "ret2usr" exploits.
+- **KPTI (Kernel Page Table Isolation):** a Meltdown (CVE-2017-5754) mitigation that keeps kernel pages unmapped in user-mode page tables, with a CR3 switch on transitions.
+- **PreviousMode:** each thread tracks whether the caller came from user or kernel mode. `Nt*` routines check it to decide whether to validate pointers and enforce access checks. `Zw*` routines called from the kernel set `PreviousMode = KernelMode`, which bypasses checks (a classic driver bug source).
+- **EDR hooks:** because user-mode hooks in `ntdll` can be bypassed with direct syscalls, modern EDR relies on kernel callbacks (`PsSetCreateProcessNotifyRoutineEx`, `ObRegisterCallbacks`), ETW Threat Intelligence, and PPL/ELAM.
+
+### Isolation Boundaries (Summary)
+| Boundary | Enforced By |
+|----------|-------------|
+| User ↔ Kernel | CPU rings, page tables (U/S bit), syscall validation |
+| Process ↔ Process | Separate virtual address spaces, handle table, access tokens, integrity levels |
+| Session ↔ Session | Session isolation (Session 0 isolation for services since Vista) |
+| AppContainer ↔ rest of system | Low-box tokens, capability SIDs |
+| VTL0 ↔ VTL1 | Hyper-V hypervisor and SLAT/EPT (VBS) |
+| Guest ↔ Host | Hyper-V partitions |
+
+---
+
+## 1.2 Core OS Architecture Components
+
+```
+┌─────────────────────────── USER MODE (Ring 3) ───────────────────────────┐
+│  Applications │ Services (svchost) │ Environment subsystem (csrss.exe)   │
+│  Subsystem DLLs: kernel32, user32, gdi32, advapi32  → ntdll.dll          │
+├─────────────────────────── KERNEL MODE (Ring 0) ─────────────────────────┤
+│  System Service Dispatcher (syscall)                                     │
+│  Executive (ntoskrnl.exe): Object Mgr │ Process/Thread Mgr │ Memory Mgr  │
+│     I/O Mgr │ SRM │ Cache Mgr │ Configuration Mgr (Registry) │ PnP │ ALPC│
+│  Kernel (ntoskrnl.exe): scheduling, interrupts/DPCs, sync primitives     │
+│  Device drivers │ win32k (windowing/GDI) │ Filter/minifilter drivers     │
+│  Hardware Abstraction Layer (hal.dll)                                    │
+├───────────────────────────── Hypervisor (Hyper-V) ───────────────────────┤
+├───────────────────────────── Hardware / Firmware / TPM ──────────────────┤
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1.2.1 Hardware Abstraction Layer (HAL)
+- Implemented in `hal.dll`. Isolates the kernel and drivers from platform-specific details: interrupt controllers (APIC), timers, DMA, bus access, and multiprocessor support.
+- Security relevance: HAL-level data structures (for example, the IDT) were historically targeted by rootkits. PatchGuard (Kernel Patch Protection, x64) periodically verifies the integrity of critical kernel structures (SSDT, IDT, GDT, key kernel code) and bugchecks with `0x109 CRITICAL_STRUCTURE_CORRUPTION` on tampering.
+
+### 1.2.2 The Windows Kernel and Executive
+
+**Kernel proper** (low-level, in `ntoskrnl.exe`): thread scheduling and dispatching, interrupt and exception handling, DPCs/APCs, spinlocks and synchronization, multiprocessor synchronization.
+
+**Executive services** (higher-level managers):
+
+| Component | Role | Security Angle |
+|-----------|------|----------------|
+| **Object Manager** | Creates, names, tracks, and secures all kernel objects (processes, threads, files, mutants, sections, tokens, registry keys). Maintains the namespace (`\Device`, `\BaseNamedObjects`, `\Sessions`, `\KnownDlls`). | Every object has a **security descriptor**. Handle creation triggers an access check via SRM. Handle tables hold the granted access mask. Reference counts prevent use-after-free. |
+| **Process & Thread Manager** | Creates processes/threads, assigns tokens | Token inheritance, `PPL` protection levels, job objects |
+| **Memory Manager** | Virtual memory, paging, section objects, working sets | Enforces page protections (R/W/X), DEP/NX, ASLR, CFG bitmap management, Kernel ASLR |
+| **I/O Manager** | IRP-based driver model, device stacks | Filter drivers (AV, DLP, EDR minifilters), driver signing enforcement |
+| **Security Reference Monitor** | Access validation, privilege checks, auditing | See 1.3 |
+| **Configuration Manager** | Registry implementation (hives) | Registry key ACLs, hive loading, `HKLM\SAM` / `HKLM\SECURITY` restricted to SYSTEM |
+| **Cache Manager** | File system caching | – |
+| **PnP & Power Managers** | Device enumeration/power | Driver load policy, Kernel DMA Protection |
+| **ALPC** | Fast local IPC | Client identity via impersonation, a frequent source of local privilege escalation |
+
+**Kernel-mode drivers:**
+- Types: bus drivers, function drivers, filter drivers, file-system minifilters (via Filter Manager `fltmgr.sys`), network (NDIS/WFP callouts).
+- **Driver Signature Enforcement (DSE):** 64-bit Windows requires kernel drivers to be signed (WHQL / Microsoft attestation signed) and verified by Code Integrity (`ci.dll`). Secure Boot adds boot-chain signing.
+- **BYOVD (Bring Your Own Vulnerable Driver)** attackers load a legitimately signed but exploitable driver to gain kernel read/write. Mitigations are HVCI, the Microsoft Vulnerable Driver Blocklist, and the ASR rule "Block abuse of exploited vulnerable signed drivers".
+- **ELAM (Early Launch Anti-Malware):** a special AV driver loaded first in boot order to classify other boot drivers.
+
+**Boot chain security (context):**
+```
+UEFI firmware → Secure Boot (db/dbx signature checks) → bootmgfw.efi → winload.efi
+ → ntoskrnl.exe + ELAM → boot drivers → Measured Boot hashes into TPM PCRs throughout
+```
+
+### 1.2.3 Subsystems: Native (NT) vs. Win32
+
+Windows NT was designed with **environment subsystems** layered on a common native API.
+
+- **Native API (`ntdll.dll`):** the lowest user-mode layer. Exports `Nt*` (syscall stubs) and `Rtl*` functions. It is largely undocumented and is the real syscall interface. Contains the loader (`Ldr*`), heap manager, and thread start code. Native applications (`smss.exe`, `autochk`) link only to `ntdll`.
+- **Win32 subsystem:**
+  - `kernel32.dll`/`kernelbase.dll`, `user32.dll`, `gdi32.dll`, `advapi32.dll` (security/registry APIs) → `ntdll`.
+  - **`csrss.exe` (Client/Server Runtime Subsystem):** user-mode process, one per session, running as SYSTEM and started by `smss.exe`. Handles console windows, process/thread creation notification, and session-wide Win32 state. It is a **critical process** (termination causes a bugcheck, `0xF4 CRITICAL_OBJECT_TERMINATION`). Runs as a Protected Process Light in modern Windows. Client DLLs talk to it via ALPC (`\Windows\ApiPort`).
+  - **`win32k*.sys` (kernel-mode):** windowing (USER) and graphics (GDI). Historically a huge attack surface for LPE. Win10+ splits it into `win32kbase.sys` and `win32kfull.sys`, and the **Win32k lockdown** mitigation (a process mitigation policy) lets sandboxed processes (Edge/Chrome renderers) disable win32k syscalls entirely.
+- **Other subsystems:** the POSIX subsystem was removed; **WSL1** uses *pico processes* and `lxss.sys`; **WSL2** runs a real Linux kernel in a lightweight Hyper-V VM. Each enlarges the attack surface and shares host files, so it must be governed by policy.
+
+**Startup chain of key user-mode processes:**
+```
+System (PID 4) → smss.exe (Session Manager) → csrss.exe + wininit.exe (Session 0)
+                                            → csrss.exe + winlogon.exe (Session 1+)
+wininit.exe → services.exe → svchost.exe instances;  wininit.exe → lsass.exe
+winlogon.exe → LogonUI.exe, userinit.exe → explorer.exe
+```
+
+---
+
+## 1.3 The Security Reference Monitor (SRM)
+
+The SRM (`SeXxx` functions inside `ntoskrnl.exe`) is the kernel-mode **reference monitor** and enforces the three classic properties: **always invoked, tamper-proof, small enough to verify**.
+
+### Responsibilities
+1. **Access validation:** `SeAccessCheck` compares the caller's **access token** with an object's **security descriptor** and the **desired access** mask. It returns a granted mask or `STATUS_ACCESS_DENIED`.
+2. **Privilege checks:** `SePrivilegeCheck`, `SeSinglePrivilegeCheck` (for example, `SeDebugPrivilege`, `SeLoadDriverPrivilege`, `SeBackupPrivilege`).
+3. **Token management:** creates tokens, duplicates and filters them (restricted tokens, `NtFilterToken`), and manages impersonation levels.
+4. **Audit generation:** produces audit records for the Security event log per audit policy and SACL, and passes them to LSASS (via the `SeRmCommandPort` / LSA ALPC port) which writes the log.
+5. **Logon session tracking:** maintains Logon Session IDs (LUIDs).
+
+### Access Check Algorithm (Simplified)
+```
+1. Mandatory Integrity Check (MIC):
+     Compare token integrity level vs. object's mandatory label (default: no-write-up).
+     If subject IL < object IL for requested rights → deny those rights.
+2. If caller holds SeTakeOwnership / SeSecurity / SeBackup / SeRestore → relevant implicit grants.
+3. If DACL is NULL → grant all access (a security flaw when unintended).
+   If DACL is empty (present, zero ACEs) → deny all access.
+4. Owner implicitly receives READ_CONTROL and WRITE_DAC unless an OWNER RIGHTS ACE exists.
+5. Walk the DACL in order (ACEs evaluated top to bottom):
+     - Access-denied ACE matching a SID in the token → deny those bits (if not already granted).
+     - Access-allowed ACE matching a SID → accumulate granted bits.
+     - Stop when all requested bits are granted or on deny.
+6. If requested bits remain ungranted at the end → STATUS_ACCESS_DENIED.
+7. For AppContainer tokens: additional check against capability SIDs / ALL APPLICATION PACKAGES.
+8. Generate audit (success/failure) if SACL audit ACEs match.
+```
+Access checks are done **at handle open time** (for example, `CreateFile`, `OpenProcess`), not on every use of the handle. Later use is checked only against the granted access mask stored in the handle.
+
+---
+
+## 1.4 Local Security Authority Subsystem Service (LSASS)
+
+`lsass.exe` is a user-mode **critical** process running as SYSTEM, started by `wininit.exe` in Session 0. It is the primary user-mode security authority.
+
+### Roles
+| Function | Description |
+|----------|-------------|
+| **Authentication** | Hosts **authentication packages (AP)** loaded as DLLs: `msv1_0.dll` (NTLM/local), `kerberos.dll`, `schannel.dll` (TLS), `wdigest.dll` (legacy), `tspkg.dll` (legacy SSO), `cloudAP.dll` (Entra/PRT), `negotiate` (SPNEGO selector), `pku2u`. |
+| **Token creation** | After successful authentication, LSASS builds the token (via `NtCreateToken`) with user SID, group SIDs, privileges (from policy). |
+| **Local security policy** | Enforces account/user-rights policy (LSA policy DB at `HKLM\SECURITY\Policy`). |
+| **Security log management** | Receives audit records from SRM and writes the Security event log. |
+| **SAM / AD interfaces** | Via `samsrv.dll` (local SAM) and `ntdsa.dll` on domain controllers. Netlogon secure channel. |
+| **Credential caching** | Holds credential material in memory for SSO: NT hashes, Kerberos TGTs/session keys, and (if WDigest enabled) plaintext. This is the prime target of credential theft (`sekurlsa::logonpasswords`). |
+
+### Credential Material Locations
+| Location | Contents |
+|----------|----------|
+| LSASS memory | NT hash, Kerberos tickets/keys, DPAPI master key cache, (WDigest plaintext if enabled) |
+| `C:\Windows\System32\config\SAM` | Local account NT hashes (encrypted with SYSKEY/boot key) |
+| `HKLM\SECURITY` | LSA secrets, cached domain logons (MSCACHEv2/DCC2), service account passwords |
+| `NTDS.dit` (DC) | All domain hashes |
+| Credential Manager / DPAPI blobs | Saved credentials |
+
+### LSASS Protection
+
+**1. RunAsPPL (LSA Protection):** runs LSASS as a **Protected Process Light** so only code signed at an equal or higher protection level can open it with memory-read rights.
+
+```powershell
+# Enable LSA protection (reboot required)
+reg add "HKLM\SYSTEM\CurrentControlSet\Control\Lsa" /v RunAsPPL /t REG_DWORD /d 1 /f
+# Value 2 (newer builds) enables it without a UEFI lock variable, so it can be disabled by policy.
+# With value 1 on UEFI systems, a UEFI variable is set so removal needs an offline step.
+
+# Verify
+Get-Process lsass | Select Name, Id      # use Process Explorer: Protection column "PsProtectedSignerLsa-Light"
+Get-WinEvent -FilterHashtable @{LogName='System'; Id=12} -MaxEvents 5   # Wininit: "LSASS.exe was started as a protected process with level: 4"
+```
+Also available via GPO: *Computer Configuration → Administrative Templates → System → Local Security Authority → Configure LSASS to run as a protected process.* Newer Windows 11 builds enable LSA protection by default on some new/enterprise-joined installs. Verify per build.
+
+**Audit mode before enforcing:**
+```
+HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\LSASS.exe
+   AuditLevel (REG_DWORD) = 8
+Events in Microsoft-Windows-CodeIntegrity/Operational: 3065 / 3066 (would-be-blocked plug-in/DLL loads)
+Enforced mode blocks: 3033 / 3063
+```
+
+**2. Credential Guard:** moves secrets to `LsaIso.exe` inside VBS (see 3.2).
+
+**3. Related hardening:**
+- Disable WDigest plaintext caching: `HKLM\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest\UseLogonCredential = 0` (default 0 on Win 8.1+/KB2871997).
+- ASR rule **"Block credential stealing from the Windows local security authority subsystem"** (`9E6C4E1F-7D60-472F-BA1A-A39EF669E4B2`).
+- Restrict `SeDebugPrivilege` (default: Administrators; Debug programs user right).
+- Limit cached logons: `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\CachedLogonsCount` (GPO: *Interactive logon: Number of previous logons to cache*).
+- Add privileged accounts to **Protected Users**.
+- Enable auditing of Sysmon Event ID 10 (ProcessAccess to lsass.exe) and Defender/EDR LSASS-dump alerts.
+
+**Known attacker approaches against LSASS (know these for exams):** `procdump -ma lsass.exe`, `comsvcs.dll MiniDump`, Mimikatz (`sekurlsa::`), Silent Process Exit / WER abuse, `PPLdump`-style bypasses, loading a signed vulnerable driver to strip PPL (`mimidrv`, BYOVD), and offline dumps from crash dumps/VM snapshots/hibernation files.
+
+---
+
+# 2. Windows Identity, Authorization, and Access Control
+
+## 2.1 Access Tokens & Security Identifiers (SIDs)
+
+### 2.1.1 SID Structure
+
+A SID uniquely identifies a security principal (user, group, computer, service, logon session).
+
+```
+S-1-5-21-3623811015-3361044348-30300820-1013
+│ │ │  └────────── Domain/Machine identifier (3 sub-authorities) ──────┘  └ RID
+│ │ └ Identifier authority value 5 = NT Authority; then sub-authority 21 = "non-unique NT domain/machine"
+│ └ Revision (always 1)
+└ "S" prefix
+```
+
+| Component | Meaning |
+|-----------|---------|
+| Revision | 1 |
+| Identifier Authority | 5 = NT Authority, 1 = World, 16 = Mandatory Label |
+| Sub-authorities | Domain/machine unique ID (generated at install or domain creation) |
+| **RID** | Relative ID, unique within the domain/machine. RIDs below 1000 are well-known (500 = Administrator, 501 = Guest, 502 = krbtgt, 512 = Domain Admins, 513 = Domain Users, 519 = Enterprise Admins); user-created accounts start at 1000. |
+
+**Well-known SIDs:**
+
+| SID | Name |
+|-----|------|
+| `S-1-1-0` | Everyone |
+| `S-1-5-18` | LocalSystem (SYSTEM) |
+| `S-1-5-19` | LocalService |
+| `S-1-5-20` | NetworkService |
+| `S-1-5-32-544` | BUILTIN\Administrators |
+| `S-1-5-32-545` | BUILTIN\Users |
+| `S-1-5-11` | Authenticated Users |
+| `S-1-5-4` / `S-1-5-2` | INTERACTIVE / NETWORK |
+| `S-1-5-80-<hash>` | Service SID (per-service, `NT SERVICE\<name>`) |
+| `S-1-5-5-X-Y` | Logon Session SID |
+| `S-1-15-2-1` | ALL APPLICATION PACKAGES (AppContainer) |
+| `S-1-5-113` / `S-1-5-114` | Local account / Local account and member of Administrators |
+
+```cmd
+whoami /user
+whoami /groups
+whoami /priv
+wmic useraccount get name,sid
+```
+
+**SID security notes:** SIDs are never reused, so deleting and recreating a user yields a new SID with no inherited access. **SID History** (migration attribute) can be abused for privilege escalation across domains/forests, so SID filtering/quarantine is used. The domain SID can be cloned in unsyspreped images (cloned-machine SID issues) but is largely irrelevant for local security if machine SIDs differ by RID context.
+
+### 2.1.2 Access Token Contents
+
+An **access token** is a kernel object (`_TOKEN`) describing the security context of a process or thread. Created by LSASS at logon; inspected by the SRM at every access check.
+
+| Field | Description |
+|-------|-------------|
+| **User SID** | Identity of the principal |
+| **Group SIDs** | All group memberships, with attributes (Enabled, Mandatory, Deny-only, Owner, Integrity) |
+| **Privileges** | List with state (Enabled/Disabled), for example `SeShutdownPrivilege` |
+| **Logon Session ID (LUID)** | Ties token to a logon session |
+| **Token type** | **Primary** (assigned to process) or **Impersonation** (thread) |
+| **Impersonation level** | Anonymous, Identification, Impersonation, Delegation |
+| **Integrity level SID** | `S-1-16-xxxx` |
+| **Owner SID / Primary group** | Default owner for new objects |
+| **Default DACL** | Applied to objects created without an explicit descriptor |
+| **Restricting SIDs** | For restricted tokens: second access check pass |
+| **Session ID** | Terminal Services session |
+| **Linked token** | For UAC split tokens |
+| **AppContainer SID / Capabilities** | Low-box info |
+| **Device groups / Claims** | Dynamic Access Control, conditional ACEs |
+| **Elevation type** | Default / Full / Limited |
+
+**Key distinctions:**
+- **Primary token:** one per process, inherited by children from the parent at `CreateProcess`.
+- **Impersonation token:** a server thread temporarily adopts a client's identity (`ImpersonateNamedPipeClient`, `RpcImpersonateClient`, `ImpersonateLoggedOnUser`).
+  - *Anonymous:* no identity information. *Identification:* may query identity, cannot act. *Impersonation:* acts locally as the client. *Delegation:* acts locally and on remote systems (needs Kerberos delegation).
+  - Accounts with `SeImpersonatePrivilege` (service accounts, IIS, SQL) are the target of "Potato" attacks (JuicyPotato, PrintSpoofer, RoguePotato, GodPotato), which coax a SYSTEM client to connect and then impersonate it.
+- **Token duplication/theft:** `DuplicateTokenEx`, `OpenProcessToken`. Requires `SeDebugPrivilege` or an appropriate handle. Tools: Incognito, Mimikatz `token::elevate`.
+
+**Dangerous privileges:**
+
+| Privilege | Abuse |
+|-----------|-------|
+| `SeDebugPrivilege` | Open any process (including SYSTEM) → inject / steal tokens / dump LSASS |
+| `SeImpersonatePrivilege` / `SeAssignPrimaryTokenPrivilege` | Potato-style escalation to SYSTEM |
+| `SeBackupPrivilege` / `SeRestorePrivilege` | Read/write any file bypassing ACLs (copy SAM/NTDS.dit, overwrite binaries) |
+| `SeTakeOwnershipPrivilege` | Take ownership of any object → rewrite its DACL |
+| `SeLoadDriverPrivilege` | Load kernel driver (BYOVD) |
+| `SeTcbPrivilege` | "Act as part of OS": create tokens / impersonate any user without a password |
+| `SeCreateTokenPrivilege` | Forge arbitrary tokens |
+| `SeManageVolumePrivilege` | Raw volume access (SeManageVolumeExploit) |
+
+Verify with `whoami /priv` (note that a *Disabled* privilege can still be enabled by the process through `AdjustTokenPrivileges`; only *absent* privileges are unavailable).
+
+### 2.1.3 Integrity Levels (Mandatory Integrity Control, MIC)
+
+Introduced in Vista, MIC adds a **mandatory** check *in addition to* the discretionary DACL check. It restricts what lower-integrity processes can do to higher-integrity objects, independent of ACL permissions.
+
+| Level | SID | Typical Subjects |
+|-------|-----|------------------|
+| Untrusted | `S-1-16-0` | Anonymous logon |
+| **Low** | `S-1-16-4096` | Protected Mode IE/Edge legacy, sandboxed renderers, AppContainer (low) |
+| **Medium** | `S-1-16-8192` | Standard user processes, filtered admin token |
+| Medium Plus | `S-1-16-8448` | Some broker processes |
+| **High** | `S-1-16-12288` | Elevated administrator processes |
+| **System** | `S-1-16-16384` | SYSTEM services, kernel |
+| Protected | `S-1-16-20480` | Protected processes (rare) |
+
+- **Object labels** are stored as a `SYSTEM_MANDATORY_LABEL_ACE` in the **SACL** with a policy mask: `NO_WRITE_UP` (default), `NO_READ_UP`, `NO_EXECUTE_UP`.
+- Default: objects inherit Medium; the subject's IL must be ≥ object's IL to **write**. A Low-integrity process can read Medium files if the DACL allows but cannot write to them.
+- Also provides **UIPI** (User Interface Privilege Isolation): lower-IL windows cannot send most messages to higher-IL windows (blocks shatter attacks).
+- Tools: `icacls file /setintegritylevel L`, Process Explorer (Integrity column), `whoami /groups` shows `Mandatory Label\Medium Mandatory Level`.
+
+**How tokens dictate process privileges (summary):** the process token determines (a) *who* the process is (user + groups) for DACL matching, (b) *what system operations* it may perform (privileges), (c) *how trusted* it is relative to objects (integrity level, MIC), (d) *how restricted* it is (restricted SIDs, AppContainer capabilities), and (e) *how far* its identity can be delegated (impersonation level).
+
+---
+
+## 2.2 Security Descriptors & Access Control Lists (ACLs)
+
+### 2.2.1 Security Descriptor Structure
+
+Every securable object (file, key, process, service, pipe, desktop...) has a **security descriptor (SD)**:
+
+| Component | Meaning |
+|-----------|---------|
+| **Owner SID** | Object owner (can always modify the DACL unless limited by OWNER RIGHTS) |
+| **Primary Group SID** | POSIX compatibility (rarely used) |
+| **DACL** | Discretionary ACL: who is allowed/denied what |
+| **SACL** | System ACL: audit rules + mandatory integrity label |
+| **Control flags** | `SE_DACL_PRESENT`, `SE_DACL_PROTECTED` (blocks inheritance), `SE_DACL_AUTO_INHERITED`, `SE_SACL_PRESENT`, `SE_SELF_RELATIVE`, etc. |
+
+**SDDL example:**
+```
+O:BAG:SYD:PAI(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;BU)S:(ML;;NW;;;LW)
+```
+- `O:BA` owner = Builtin Administrators; `G:SY` group = SYSTEM
+- `D:PAI` DACL, **P**rotected, **A**uto-**I**nherited
+- `(A;OICI;FA;;;BA)` Allow, Object Inherit + Container Inherit, File All access, to BA
+- `(ML;;NW;;;LW)` Mandatory Label, No-Write-Up, Low integrity
+
+### 2.2.2 DACL vs. SACL
+
+| Feature | DACL | SACL |
+|---------|------|------|
+| Purpose | Authorization (grant/deny) | Auditing + integrity labels |
+| ACE types | Access-allowed, access-denied (plus object/callback variants) | System-audit, system-alarm, mandatory-label, resource-attribute, scoped-policy-id (central access policy) |
+| Edit right | `WRITE_DAC` | `ACCESS_SYSTEM_SECURITY` (needs `SeSecurityPrivilege`) |
+| Effect when absent | **NULL DACL = Everyone full control** | No auditing |
+| Effect when empty | **Deny everyone** | – |
+| Evaluated by | `SeAccessCheck` | Audit subsystem after the access decision |
+
+Auditing requires **both** the SACL entry *and* the audit policy category enabled (Advanced Audit Policy: *Object Access → Audit File System / Registry / Kernel Object*). Related events: **4656** (handle requested), **4663** (object accessed), **4670** (permissions changed), **4660** (deleted).
+
+### 2.2.3 Access Control Entries (ACEs)
+
+An ACE contains: **Type**, **Flags**, **Access Mask**, **Trustee SID** (plus extras for object/callback ACEs).
+
+**Access mask layout (32 bits):**
+```
+Bit 31-28: Generic rights (GR, GW, GE, GA)
+Bit 27-26: reserved
+Bit 25   : MAXIMUM_ALLOWED
+Bit 24   : ACCESS_SYSTEM_SECURITY
+Bit 23-16: Standard rights  (SYNCHRONIZE, WRITE_OWNER, WRITE_DAC, READ_CONTROL, DELETE)
+Bit 15-0 : Object-specific rights (e.g., FILE_READ_DATA, FILE_WRITE_DATA, FILE_EXECUTE...)
+```
+Generic rights are mapped to specific rights by each object type's generic mapping.
+
+**ACE inheritance flags:**
+
+| Flag | Abbrev. | Effect |
+|------|---------|--------|
+| Object Inherit | `OI` | Files in the container inherit |
+| Container Inherit | `CI` | Sub-folders inherit |
+| No Propagate Inherit | `NP` | Only one level of inheritance |
+| Inherit Only | `IO` | Does not apply to this object, only children |
+| Inherited ACE | `ID` | Marks an ACE that was inherited (as opposed to explicit) |
+
+**Explicit vs. inherited permissions:**
+- *Explicit* ACEs are set directly on the object. *Inherited* ACEs flow from the parent via `OI`/`CI`.
+- **Canonical order** in the DACL: (1) explicit deny, (2) explicit allow, (3) inherited deny (nearest parent first), (4) inherited allow. Because evaluation is top-down, explicit permissions override inherited ones, **including an explicit Allow beating an inherited Deny**.
+- Inheritance can be blocked (`SE_DACL_PROTECTED`), with options to convert inherited ACEs to explicit copies or remove them.
+
+### 2.2.4 Effective Permissions Calculation
+
+```
+Effective access = (union of all Allow ACEs matching user/group SIDs in token)
+                   MINUS (Deny ACEs, which take precedence when encountered earlier in order)
+                   then constrained by: integrity level (MIC), restricted SIDs, AppContainer rules
+```
+Practical rules:
+1. Permissions are **cumulative** across group memberships.
+2. **Deny overrides Allow** *within the same inheritance tier* (canonical ordering). Explicit Allow overrides inherited Deny.
+3. **Share vs. NTFS:** over SMB, the *most restrictive* of share permissions and NTFS permissions applies.
+4. Owner has implicit `READ_CONTROL | WRITE_DAC`.
+5. Privileges (`SeBackup`, `SeRestore`, `SeTakeOwnership`) can bypass ACL decisions.
+6. Token must be *fresh*: group membership changes take effect only at next logon (new token).
+
+```powershell
+icacls C:\Data                              # view
+icacls C:\Data /grant "Finance:(OI)(CI)M"   # grant Modify with inheritance
+icacls C:\Data /deny  "Interns:(OI)(CI)W"
+icacls C:\Data /inheritance:d               # disable inheritance and convert to explicit
+icacls C:\Data /setintegritylevel M
+(Get-Acl C:\Data).Sddl                      # SDDL string
+Get-Acl HKLM:\SOFTWARE\MyApp | Format-List
+accesschk.exe -uwdqs Users C:\              # Sysinternals: find weak permissions (privesc hunting)
+```
+**Common misconfigurations (OSCP-relevant):** writable service binary paths, unquoted service paths, weak service DACLs (`sc sdshow`), writable folders in `PATH`/DLL search paths, `AlwaysInstallElevated`, modifiable scheduled task binaries, NULL DACLs.
+
+**Advanced model:** *Dynamic Access Control* (claims, conditional ACEs `XA;...`), *Central Access Policies*, and **AppContainer** capability checks add attribute-based conditions on top of the classic DACL model.
+
+---
+
+## 2.3 Authentication Subsystems
+
+### 2.3.1 Logon Overview
+Interactive logon flow: `winlogon.exe` → credential provider (`LogonUI`) → `LsaLogonUser` in LSASS → authentication package (Kerberos/NTLM/CloudAP) → token creation → `userinit.exe` → `explorer.exe`.
+
+**Logon types (Event 4624 `LogonType`):** 2 Interactive, 3 Network, 4 Batch, 5 Service, 7 Unlock, 8 NetworkCleartext, 9 NewCredentials (`runas /netonly`), 10 RemoteInteractive (RDP), 11 CachedInteractive. Type 3 does *not* cache credentials in the target's LSASS; type 2/10/9 do.
+
+### 2.3.2 NTLM vs. Kerberos v5
+
+**NTLM challenge-response (NTLMv2):**
+```
+Client → Server: NEGOTIATE_MESSAGE
+Server → Client: CHALLENGE_MESSAGE (8-byte server challenge)
+Client → Server: AUTHENTICATE_MESSAGE
+    NTProofStr = HMAC-MD5( NTOWFv2 , ServerChallenge || ClientBlob )
+    NTOWFv2 = HMAC-MD5( NT-hash , UPPER(username) || domain )
+Server → DC (NetLogon pass-through) or local SAM verifies; password never sent.
+```
+**Kerberos v5 (domain, port 88):**
+```
+1. AS-REQ  → KDC (DC): client requests a TGT (pre-authentication: timestamp encrypted with user's key)
+2. AS-REP  ← KDC: TGT (encrypted with krbtgt key; contains PAC) + session key (encrypted with user's key)
+3. TGS-REQ → KDC: present TGT + request ticket for service SPN
+4. TGS-REP ← KDC: service ticket (encrypted with service account's key)
+5. AP-REQ  → Service: present service ticket + authenticator
+6. AP-REP  ← Service (optional mutual authentication)
+```
+The **PAC (Privilege Attribute Certificate)** inside tickets carries the user SID, group SIDs, and claims, signed by the KDC; services use it to build the token.
+
+| Aspect | NTLM | Kerberos v5 |
+|--------|------|-------------|
+| Mechanism | Challenge–response, hash-based | Ticket-based with trusted third party (KDC) |
+| Mutual authentication | **No** (server not authenticated) | **Yes** (optional AP-REP) |
+| Needs DC online during auth | Yes (pass-through) for domain accounts | KDC needed to obtain tickets; service validates offline |
+| Works with IP addresses / non-domain | Yes | No: needs SPN/hostname and domain trust |
+| Delegation | None (no native delegation) | Unconstrained, constrained, RBCD |
+| Crypto | MD4 (NT hash), HMAC-MD5; no salt | AES256/AES128-CTS-HMAC-SHA1 (RC4 legacy, being phased out) |
+| Replay protection | Weak (relay possible) | Timestamps (5-minute skew), authenticator, replay cache |
+| Typical attacks | Pass-the-Hash, NTLM relay (SMB/LDAP/HTTP, `ntlmrelayx`), offline cracking of Net-NTLMv2, coercion (PetitPotam, PrinterBug) | Kerberoasting, AS-REP roasting, Pass-the-Ticket, Overpass-the-Hash, Golden/Silver/Diamond tickets, delegation abuse, S4U |
+| Hardening | Disable NTLMv1 (`LmCompatibilityLevel = 5`), SMB signing, LDAP signing + channel binding, EPA, block outbound NTLM (policy "Restrict NTLM"), add accounts to Protected Users | Long random service/gMSA passwords, enforce AES, rotate `krbtgt` twice, disable unconstrained delegation, Protected Users, PAC validation, Credential Guard |
+| Event IDs | 4624 (Package: NTLM V2), 4776 | 4768 (TGT), 4769 (TGS), 4771 (pre-auth failure) |
+
+Notes: Microsoft has announced a roadmap of NTLM deprecation (auditing and eventually disabling by default in future Windows releases) and Kerberos improvements such as IAKerb and Local KDC for non-domain scenarios. Consult current documentation.
+
+```cmd
+klist                      :: view/purge Kerberos tickets
+klist purge
+setspn -L svc_sql          :: list SPNs (Kerberoasting targets)
+reg query HKLM\SYSTEM\CurrentControlSet\Control\Lsa /v LmCompatibilityLevel
+```
+
+### 2.3.3 DPAPI (Data Protection API)
+
+Provides symmetric encryption of secrets bound to the user or machine without the application managing keys.
+
+- **APIs:** `CryptProtectData` / `CryptUnprotectData` (and CNG DPAPI `NCryptProtectSecret`); optional extra **entropy** and `CRYPTPROTECT_LOCAL_MACHINE` flag.
+- **Key hierarchy:**
+```
+User password (or NT/SHA1 hash) → PBKDF2 (pre-key) → decrypts the user MASTER KEY (64 bytes, random)
+Master key stored at:  %APPDATA%\Microsoft\Protect\<UserSID>\<GUID>   (rotated roughly every 90 days)
+Master key → derives session key (with salt + entropy) → AES256/3DES encrypts the data BLOB
+Domain users: master key is also encrypted with the DC's DPAPI **domain backup key**
+ (MS-BKRP, RPC), which allows recovery after password reset.
+Machine scope: keys under C:\Windows\System32\Microsoft\Protect\S-1-5-18 (SYSTEM / DPAPI_SYSTEM LSA secret)
+```
+- **Consumers:** Credential Manager vault, Chrome/Edge saved passwords and cookie key (`Local State`, partly migrated to App-Bound Encryption in newer Chromium), Wi-Fi keys, EFS keys, certificates' private keys (software KSP), Outlook, RDP `.rdg`, scheduled-task credentials.
+- **Attacks:** Mimikatz `dpapi::masterkey`, `dpapi::cred`, `sekurlsa::dpapi`; SharpDPAPI; theft of the domain backup key with DA rights (`lsadump::backupkeys`) decrypts *all* users' blobs; offline cracking of master keys from a password.
+- **Defenses:** strong passwords, Credential Guard (protects DPAPI-related domain secrets in LSA), restricting domain-admin exposure, TPM/Windows Hello-bound keys, using `NCrypt` with TPM-backed keys where feasible.
+
+### 2.3.4 Modern Cloud-Hybrid Identity (Entra ID / Azure AD)
+
+**Device identity states:**
+
+| State | Meaning |
+|-------|---------|
+| **Entra registered** | BYOD personal device with a work account added |
+| **Entra joined** | Cloud-only org-owned device; user signs in with Entra account |
+| **Hybrid Entra joined** | Device is joined to on-prem AD *and* registered in Entra (via Entra Connect / sync) |
+
+- Check status: `dsregcmd /status` (look for `AzureAdJoined`, `DomainJoined`, `AzureAdPrt : YES`, `NgcSet`).
+- **Primary Refresh Token (PRT):** a long-lived SSO token issued at sign-in, bound to the device via the **device key (TPM-protected)** and a session key. `CloudAP` (in LSASS) handles it; the **Web Account Manager (WAM)** and the browser extension use it to get access tokens for apps (SSO). Theft of the PRT/session key (for example, via tools like ROADtools, AADInternals, Mimikatz `sekurlsa::cloudap`) enables token replay, which is why TPM-bound keys and **Token Protection** in Conditional Access matter.
+- **Conditional Access:** policy engine using signals (user, device compliance from Intune, location, risk) to enforce MFA, compliant device, or block.
+- **Intune/MDM:** configures baselines (BitLocker, ASR, Defender, WDAC, LAPS) via CSPs.
+- **Windows LAPS:** automatic rotation of local admin passwords, stored in AD or Entra ID.
+- **Cloud Kerberos Trust:** allows Windows Hello for Business to obtain on-prem Kerberos TGTs using a partial TGT issued by Entra ID, without PKI.
+- **Hybrid attack paths:** Entra Connect server compromise, sync account abuse, Seamless SSO (`AZUREADSSOACC` account), PTA agent abuse.
+
+---
+
+# 3. Core Windows Security Technologies (Windows 10/11)
+
+## 3.1 Virtualization-Based Security (VBS) & Hypervisor-Protected Code Integrity (HVCI)
+
+### 3.1.1 How VBS Works
+
+VBS uses the **Hyper-V hypervisor** (a Type-1 hypervisor, running at "Ring -1") to carve the OS into **Virtual Trust Levels (VTLs)**. The *root partition* (the normal Windows OS) is itself virtualized.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ VTL1 (Secure World)             │ VTL0 (Normal World)       │
+│  Secure Kernel (securekernel.exe)│  Normal NT kernel (ntoskrnl)│
+│  Isolated User Mode (IUM)       │  Drivers, apps, services  │
+│   Trustlets: LsaIso.exe, vmsp   │                           │
+│  Code integrity engine (skci.dll)│                           │
+├─────────────────────────────────────────────────────────────┤
+│        Hyper-V Hypervisor (enforces memory isolation)       │
+│   SLAT (Intel EPT / AMD NPT) page-table permissions per VTL │
+├─────────────────────────────────────────────────────────────┤
+│  Hardware: virtualization ext., IOMMU (VT-d/AMD-Vi), TPM 2.0, UEFI Secure Boot │
+└─────────────────────────────────────────────────────────────┘
+```
+- **VTL1 is more privileged than VTL0**: even a Ring-0 attacker in VTL0 cannot read VTL1 memory because the hypervisor controls the **Second Level Address Translation (SLAT)** tables and denies VTL0 mappings to VTL1 pages.
+- **Secure Kernel (`securekernel.exe`)** is a minimal kernel in VTL1; it does not run drivers. It communicates with the normal kernel through a narrow, hypervisor-mediated interface (secure calls / `VSM` calls).
+- **Isolated User Mode (IUM)** hosts **trustlets** (secure processes): `LsaIso.exe` (Credential Guard), vTPM trustlet (`vmsp.exe`), and Enhanced Sign-in Security biometric components.
+- **Requirements:** 64-bit CPU with virtualization extensions + SLAT, UEFI with Secure Boot, IOMMU (for DMA protection), TPM 2.0 recommended, and **MBEC** (Mode-Based Execute Control / on AMD GMET) for efficient HVCI. Windows 11 enables VBS/memory integrity by default on qualifying new installs and OEM devices.
+
+### 3.1.2 HVCI (Memory Integrity)
+
+HVCI (UI name: **Core Isolation → Memory integrity**) moves **kernel-mode code-integrity enforcement into VTL1** and uses SLAT to enforce **W^X (write XOR execute)** on kernel memory.
+
+Mechanism:
+1. When the kernel loads a driver or kernel-mode image, `ci.dll`/the VTL1 code-integrity component (`skci.dll`) validates its signature **in the secure world**.
+2. Only after validation does the secure kernel mark the **SLAT entries** for the driver's code pages as *executable and read-only* in VTL0.
+3. Pages that are writable are *never* executable and vice versa. An attacker who obtains arbitrary kernel write cannot make a data page executable or modify signed code, because the PTE permissions in VTL0 are overridden by SLAT permissions controlled by VTL1.
+4. Dynamic kernel code generation (JIT in kernel, self-modifying drivers) is blocked, so legacy drivers that allocate RWX memory or use `NonPagedPool` (executable) must be updated to `NonPagedPoolNx` and to avoid W+X sections. Incompatible drivers prevent HVCI from being enabled (UI lists them).
+
+**Protection outcomes:** blocks unsigned/tampered kernel code, shellcode in kernel pools, many driver exploits' final payload stage, and (with the **Vulnerable Driver Blocklist**) loading of known-bad drivers.
+
+**Driver block rules:**
+```
+Microsoft Vulnerable Driver Blocklist (enforced by CI):
+  HKLM\SYSTEM\CurrentControlSet\Control\CI\Config\VulnerableDriverBlocklistEnable = 1  (default on with HVCI; on by default in recent Win11)
+  File: C:\Windows\System32\CodeIntegrity\driversipolicy.p7b
+Also: WDAC "Microsoft recommended driver block rules" policy, and the ASR rule
+      "Block abuse of exploited vulnerable signed drivers" (56a863a9-875e-4185-98a7-b882c64b5ce5)
+```
+**Enabling / verifying:**
+```
+GPO: Computer Configuration → Administrative Templates → System → Device Guard
+      → "Turn On Virtualization Based Security"  (Platform Security Level: Secure Boot (+DMA Protection);
+        Virtualization Based Protection of Code Integrity: Enabled with/without UEFI lock)
+Registry:
+  HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\EnableVirtualizationBasedSecurity = 1
+  HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\RequirePlatformSecurityFeatures   = 1 (Secure Boot) or 3 (Secure Boot + DMA)
+  HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity\Enabled = 1
+Verify:
+  msinfo32  → "Virtualization-based security: Running", "Services running: Credential Guard, Hypervisor enforced Code Integrity"
+  Get-CimInstance -ClassName Win32_DeviceGuard -Namespace root\Microsoft\Windows\DeviceGuard
+```
+**Related technologies:** *Kernel DMA Protection* (IOMMU blocks Thunderbolt/PCIe DMA attacks before login), *System Guard Secure Launch / DRTM* (measured late launch to cut firmware out of the trust chain), *SMM protection*, *Hardware-enforced Stack Protection (CET shadow stacks)* for kernel mode, and *Secured-core PC* (an OEM bundle of all these).
+
+---
+
+## 3.2 Credential Guard & Device Guard
+
+### 3.2.1 Credential Guard
+
+**Goal:** protect domain credential secrets from theft even by an attacker with SYSTEM or kernel-level code execution in VTL0.
+
+**Mechanism:**
+- `LsaIso.exe` (LSA Isolated, a VTL1 trustlet) holds the *secrets*: **NTLM password hashes (NT hash), Kerberos TGTs and long-term/session keys, and domain credentials stored by Credential Manager**.
+- The normal `lsass.exe` keeps only *opaque handles/blobs*. When it needs a secret operation (for example, answering an NTLM challenge or decrypting a TGS), it makes an **RPC call to `LsaIso`**, which performs the crypto in VTL1 and returns the result, never the key.
+- Communication is authenticated and the isolated memory is unreadable from VTL0.
+```
+App → lsass.exe (VTL0)  ──RPC (hypervisor-mediated)──►  LsaIso.exe (VTL1: holds NT hash, TGT keys)
+        ▲ no raw secrets in this process memory               performs NTLM response / Kerberos crypto
+```
+**Mitigation of attacks:**
+
+| Attack | Why Credential Guard Helps |
+|--------|----------------------------|
+| **Pass-the-Hash** | NT hashes of domain/MSA logons are not present in LSASS memory to be dumped and replayed |
+| **Pass-the-Ticket** | TGTs and session keys are isolated; exported tickets are unusable without the session key (service tickets may still be exportable as limited-scope) |
+| **Overpass-the-Hash / Kerberoast keys** | Long-term keys not retrievable from memory |
+| Offline cracking of dumped LSASS | No usable hashes in the dump |
+
+**Limitations (important for exams):**
+- Does **not** protect: the local SAM and local accounts, Microsoft account secrets in some scenarios, credentials typed into keyloggers, secrets of applications that don't use LSA, **an attacker already on the device who can use the credentials' *capability* while logged in** (they can request tickets, though they cannot steal the key to use elsewhere), or DC credentials (not supported on Domain Controllers).
+- Breaks: NTLMv1, MS-CHAPv2 SSO, Kerberos unconstrained delegation, DES/RC4-only Kerberos TGT, CredSSP credential delegation (use Remote Credential Guard / RDP restricted admin instead).
+- **Remote Credential Guard:** redirects Kerberos requests back to the originating device during RDP, so the credentials never reach the remote host.
+
+**Enable / verify:**
+```
+GPO: Computer Configuration → Administrative Templates → System → Device Guard
+     → Turn On Virtualization Based Security → Credential Guard Configuration:
+        "Enabled with UEFI lock" (LsaCfgFlags=1; can't be turned off remotely) or "Enabled without lock" (LsaCfgFlags=2)
+Registry: HKLM\SYSTEM\CurrentControlSet\Control\LSA\LsaCfgFlags
+Check:    msinfo32 → "Credential Guard" under "Virtualization-based security Services Running"
+          tasklist | findstr /i lsaiso     (LsaIso.exe present)
+          Event Viewer: System log, Source "WinInit" 
+```
+Windows 11 22H2+ enables Credential Guard by default on eligible Enterprise/Education devices that meet hardware requirements and are not already configured otherwise.
+
+### 3.2.2 Device Guard (Historical Umbrella Term)
+
+"Device Guard" (Windows 10 1507) was a *marketing bundle* of:
+1. **UMCI/KMCI code integrity policies** (now **WDAC / App Control for Business**), and
+2. **VBS-protected HVCI** (hypervisor-enforced kernel code integrity).
+
+The brand is deprecated. Features are configured and named separately. Its principle remains: **only trusted, signed, approved code can run in user and kernel mode**, enforced by hardware-backed isolation, so even administrators or kernel exploits can't alter the policy at runtime.
+
+---
+
+## 3.3 Windows Defender Exploit Guard (and Microsoft Defender Evolution)
+
+Exploit Guard (Windows 10 1709) is a suite built into Microsoft Defender Antivirus/Endpoint: **ASR, Exploit Protection, Network Protection, Controlled Folder Access**. The brand name was retired but the features remain under Microsoft Defender for Endpoint / Windows Security. Some require Defender Antivirus as the active AV (real-time protection on).
+
+### 3.3.1 Attack Surface Reduction (ASR) Rules
+
+ASR rules block *behaviors* commonly abused by malware (macros, scripts, LOLBins, credential theft). Identified by **GUID**.
+
+**Modes:** `0 = Disabled`, `1 = Block`, `2 = Audit`, `6 = Warn` (user may bypass for 24h).
+
+| Rule | GUID |
+|------|------|
+| Block all Office applications from creating child processes | `D4F940AB-401B-4EFC-AADC-AD5F3C50688A` |
+| Block executable content from email client and webmail | `BE9BA2D9-53EA-4CDC-84E5-9B1EEEE46550` |
+| Block Office applications from creating executable content | `3B576869-A4EC-4529-8536-B80A7769E899` |
+| Block Office applications from injecting code into other processes | `75668C1F-73B5-4CF0-BB93-3ECF5CB7CC84` |
+| Block JavaScript or VBScript from launching downloaded executable content | `D3E037E1-3EB8-44C8-A917-57927947596D` |
+| Block execution of potentially obfuscated scripts | `5BEB7EFE-FD9A-4556-801D-275E5FFC04CC` |
+| Block Win32 API calls from Office macros | `92E97FA1-2EDF-4476-BDD6-9DD0B4DDDC7B` |
+| Block executable files from running unless they meet prevalence, age, or trusted-list criteria | `01443614-CD74-433A-B99E-2ECDC07BFC25` |
+| Use advanced protection against ransomware | `C1DB55AB-C21A-4637-BB3F-A12568109D35` |
+| Block credential stealing from the Windows local security authority subsystem (lsass.exe) | `9E6C4E1F-7D60-472F-BA1A-A39EF669E4B2` |
+| Block process creations originating from PSExec and WMI commands | `D1E49AAC-8F56-4280-B9BA-993A6D77406C` |
+| Block untrusted and unsigned processes that run from USB | `B2B3F03D-6A65-4F7B-A9C7-1C7EF74A9BA4` |
+| Block Office communication application from creating child processes | `26190899-1602-49E8-8B27-EB1D0A1CE869` |
+| Block Adobe Reader from creating child processes | `7674BA52-37EB-4A4F-A9A1-F0F9A1619A2C` |
+| Block persistence through WMI event subscription | `E6DB77E5-3DF2-4CF1-B95A-636979351E5B` |
+| Block abuse of exploited vulnerable signed drivers | `56A863A9-875E-4185-98A7-B882C64B5CE5` |
+| Block webshell creation for Servers | `A8F5898E-1DC8-49A9-9878-85004B8A61E6` |
+
+(Additional rules are added over time. Check the current Microsoft reference. Note that ASR rule behaviors depend on cloud-delivered protection for the reputation-based ones.)
+
+**How the key rules work:**
+- **Office child processes:** Word/Excel/PowerPoint/Outlook (and Access/OneNote) spawning `cmd.exe`, `powershell.exe`, `wscript.exe`, `mshta.exe` etc. is the classic macro-malware kill chain. The rule blocks the `CreateProcess` event from these parents.
+- **Executable content from email:** blocks `.exe`, `.dll`, `.scr`, scripts delivered through Outlook or webmail clients (and archives containing them).
+- **Obfuscated scripts:** uses AMSI (Antimalware Scan Interface) to inspect script content after de-obfuscation at runtime, so even dynamically decoded PowerShell/JS is scanned.
+- **LSASS credential stealing:** blocks untrusted processes from opening LSASS handles with read access.
+- **PSExec/WMI:** blocks child processes spawned by `PSEXESVC` and `WmiPrvSE.exe`. **Incompatible with Configuration Manager (SCCM) client**, which needs exclusions.
+- **Ransomware rule:** cloud heuristic for files that look like ransomware encryption behavior.
+
+```powershell
+# Enable a rule in Block mode
+Add-MpPreference -AttackSurfaceReductionRules_Ids D4F940AB-401B-4EFC-AADC-AD5F3C50688A `
+                 -AttackSurfaceReductionRules_Actions Enabled
+# Audit mode first (recommended)
+Add-MpPreference -AttackSurfaceReductionRules_Ids BE9BA2D9-53EA-4CDC-84E5-9B1EEEE46550 `
+                 -AttackSurfaceReductionRules_Actions AuditMode
+# Exclusions (use sparingly)
+Add-MpPreference -AttackSurfaceReductionOnlyExclusions "C:\Tools\legacy.exe"
+# Review configured rules
+Get-MpPreference | Select AttackSurfaceReductionRules_Ids, AttackSurfaceReductionRules_Actions
+```
+**Deployment:** Intune (Endpoint security → Attack surface reduction), Group Policy (*Windows Components → Microsoft Defender Antivirus → Microsoft Defender Exploit Guard → Attack Surface Reduction*), Configuration Manager, or PowerShell.
+**Events** (`Microsoft-Windows-Windows Defender/Operational`): **1121** = blocked, **1122** = audited, **5007** = configuration changed. Use *Audit* mode plus Advanced Hunting (`DeviceEvents | where ActionType startswith "Asr"`) to tune before enforcing.
+
+### 3.3.2 Exploit Protection (Successor to EMET)
+
+System-wide and **per-application** mitigations, configurable through *Windows Security → App & browser control → Exploit protection*, PowerShell, XML, or Intune/GPO.
+
+| Mitigation | How It Works (Under the Hood) | Notes |
+|-----------|-------------------------------|-------|
+| **DEP (Data Execution Prevention)** | Uses the CPU **NX/XD bit** in page-table entries to mark data pages (stack, heap) non-executable; executing them raises an access violation. | Policy via `bcdedit /set nx OptIn|OptOut|AlwaysOn|AlwaysOff`. x64 always enforces for 64-bit processes. Defeated by ROP/ret2libc, so it is paired with ASLR/CFG/CET. |
+| **ASLR (Address Space Layout Randomization)** | Randomizes base addresses of images, stack, heap, PEB/TEB (and kernel: KASLR). Options: *Force randomization for images (Mandatory ASLR)*, *Randomize memory allocations (bottom-up)*, *High-entropy ASLR* (64-bit, much larger entropy). | Images must be linked with `/DYNAMICBASE`; *Mandatory ASLR* relocates even non-opted-in images. Defeated by information leaks. |
+| **CFG (Control Flow Guard)** | Compiler (`/guard:cf`) inserts a check before each *indirect call*; target must be a valid function entry per a **CFG bitmap** maintained by the kernel/loader (`ntdll!LdrpValidateUserCallTarget`). Invalid target → fast-fail (`__fastfail`). | Mitigates vtable/function-pointer hijacking. Successor: **XFG (eXtended Flow Guard)** (type-hash check) and **CET shadow stacks** (see below). |
+| **SEHOP (Structured Exception Handler Overwrite Protection)** | Validates that the SEH chain on the stack terminates at `ntdll!FinalExceptionHandler` before dispatching an exception. Overwritten SEH records break the chain. | Only relevant to 32-bit processes (x64 uses table-based exceptions). |
+| Hardware-enforced Stack Protection (**CET**) | Shadow stack in hardware stores return addresses; mismatches on `RET` cause a fault. Defeats ROP. | Windows 10 2004+/Win11 on supported CPUs; opt-in per process. |
+| **Arbitrary Code Guard (ACG)** | Prevents allocating/modifying executable memory (`VirtualProtect` to RWX, `VirtualAlloc` EXEC) | Breaks JIT-based apps, so use for hardened hosts. |
+| **Code Integrity Guard (CIG)** | Process loads only Microsoft/Store-signed DLLs | Used by browser sandboxes. |
+| **Block remote images / low-integrity images** | Prevents DLL loads from UNC paths or low-IL locations (DLL planting) | |
+| **Block child process creation** | Process cannot spawn child processes | Mitigates RCE-to-shell chains. |
+| **Export / Import address filtering (EAF/IAF)** | Guard pages on export/import tables detect shellcode resolving APIs (`kernel32` exports) | Compat issues with some security tools. |
+| **Heap termination on corruption** | Terminates process on heap metadata corruption | Enabled by default for modern apps. |
+| **Validate heap integrity / handle usage / image dependency signing** | Additional hardening | |
+| **Disable Win32k system calls** | Eliminates win32k attack surface for non-GUI processes | |
+
+```powershell
+Get-ProcessMitigation -System                       # system defaults
+Get-ProcessMitigation -Name winword.exe
+Set-ProcessMitigation -Name acrord32.exe -Enable DisallowChildProcessCreation, BlockRemoteImageLoads
+Set-ProcessMitigation -System -Enable DEP,SEHOP,ForceRelocateImages
+Get-ProcessMitigation -RegistryConfigFilePath settings.xml   # import/export config for GPO (ProcessMitigations XML)
+```
+Per-app settings are stored under `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\<exe>\MitigationOptions`. Verify with Process Explorer's *Security* tab or `Get-ProcessMitigation`.
+
+### 3.3.3 Network Protection
+
+- Extends **Microsoft Defender SmartScreen** reputation checks to **all outbound HTTP(S) connections from any process** (not just Edge), blocking connections to low-reputation IPs/domains and malicious URLs, plus custom indicators from Defender for Endpoint.
+- Hooks in the network stack (WFP) and inspects connection metadata. Modes: Disabled / **Block** / Audit.
+```powershell
+Set-MpPreference -EnableNetworkProtection Enabled     # or AuditMode
+Get-MpPreference | Select EnableNetworkProtection
+```
+Events: **1125** (audit) / **1126** (block) in `Windows Defender/Operational`; GPO: *Microsoft Defender Exploit Guard → Network Protection*. Windows 11 also offers **Web content filtering** (Defender for Endpoint) and Enhanced Phishing Protection in SmartScreen (warns when typing the Windows password into untrusted apps/sites).
+
+### 3.3.4 Controlled Folder Access (CFA) & Ransomware Mitigation
+
+- CFA allows only **trusted apps** (determined by reputation / Microsoft-signed / allowlist) to write to protected folders (Documents, Pictures, Videos, Music, Favorites, Desktop, plus custom ones).
+- Implemented through a Defender minifilter driver (`WdFilter.sys`), which evaluates write operations by the calling process.
+```powershell
+Set-MpPreference -EnableControlledFolderAccess Enabled          # AuditMode for testing
+Add-MpPreference -ControlledFolderAccessProtectedFolders "D:\Finance"
+Add-MpPreference -ControlledFolderAccessAllowedApplications "C:\Apps\trusted.exe"
+```
+Events: **1123** (blocked), **1124** (audited), **5007** (config change).
+
+**Layered ransomware strategy:**
+
+| Layer | Controls |
+|-------|----------|
+| Prevention | ASR rules (Office children, scripts, email executables, ransomware rule), SmartScreen/Network Protection, patching, MFA, disabling macros from the internet (Mark-of-the-Web) |
+| Execution control | WDAC/AppLocker/Smart App Control |
+| Containment | CFA, least privilege, LAPS, network segmentation, SMB hardening (disable SMBv1), tamper protection |
+| Recovery | **3-2-1 offline/immutable backups**, VSS protection, OneDrive Files Restore / version history |
+| Detection | Defender for Endpoint EDR, canary files, honeypot ACL auditing, Event 4663 mass renames |
+| Credentials | Credential Guard, LSASS PPL, Protected Users, tiered admin model |
+
+*Tamper Protection* prevents disabling Defender features via registry/PowerShell/GPO (managed via Intune/Security portal), which is a key control because attackers routinely run `Set-MpPreference -DisableRealtimeMonitoring $true`.
+
+---
+
+## 3.4 BitLocker Drive Encryption & TPM 2.0
+
+### 3.4.1 Cryptographic Architecture
+
+**Encryption algorithms:** AES in **XTS mode** (default on Windows 10 1511+/Windows 11 for fixed and OS drives: XTS-AES 128; XTS-AES 256 selectable), AES-CBC 128/256 (legacy and for removable drives compatible with older Windows). XTS is designed for disk encryption, with the sector number as the tweak, which prevents swapping/ciphertext-malleability attacks that plagued CBC with Elephant Diffuser (removed in 1511).
+
+**Key hierarchy (three layers):**
+```
+Data on disk ──encrypted with──►  FVEK  (Full Volume Encryption Key; AES-XTS)
+FVEK  ──encrypted with──►  VMK   (Volume Master Key)
+VMK   ──protected by (one or more) KEY PROTECTORS──►
+        • TPM (sealed to PCR values)
+        • TPM + PIN         • TPM + Startup Key (USB)    • TPM + PIN + Startup Key
+        • Startup key only (no TPM)  • Password (data volumes)
+        • Recovery password (48-digit numerical)  • Recovery key file (.BEK)
+        • Smart card / certificate  • Network Unlock (WDS + DHCP)  • Data Recovery Agent (DRA)
+Metadata (encrypted FVEK/VMK blobs) is stored in three redundant copies in the volume's FVE metadata area.
+```
+Advantages: changing a protector or password doesn't require re-encrypting the volume (only the VMK wrapper is rewritten); key rotation is cheap.
+
+**Encryption scope:** *Used Space Only* (fast, new drives) vs. *Full disk* (also encrypts free space; use for drives that have held data).
+
+### 3.4.2 TPM 2.0 Role
+
+A **Trusted Platform Module** is a tamper-resistant crypto processor (discrete chip, firmware TPM such as Intel PTT/AMD fTPM, or Microsoft **Pluton**).
+
+| TPM Feature | Use |
+|-------------|-----|
+| **Platform Configuration Registers (PCRs)** | Hash chains. `PCR_new = Hash(PCR_old ‖ measurement)`: cannot be set arbitrarily, only extended. Used in **Measured Boot** (firmware, boot manager, boot config, Secure Boot state, drivers). |
+| **Sealing** | Data (the VMK) is encrypted by the TPM under a policy requiring specific PCR values. The TPM releases the key **only if the measured boot state matches** (for example, PCR 7 (Secure Boot config) and PCR 11 (BitLocker access control/BootMgr)). |
+| Storage Root Key (SRK) / Endorsement Key (EK) / Attestation keys | Key hierarchy, device identity, remote attestation (Health Attestation) |
+| NV storage, RNG, **anti-hammering** lockout | PIN guess throttling |
+
+Default PCR profile on UEFI with Secure Boot: **PCRs 7 and 11**, which tolerates routine firmware/boot changes while detecting Secure Boot configuration tampering. Legacy/BIOS profiles use PCRs 0, 2, 4, 11.
+
+**Unlock flow (TPM only):**
+```
+Power on → UEFI measures firmware into PCRs → Secure Boot verifies bootmgr → bootmgr measured (PCR 4/11)
+→ TPM checks PCR policy → releases VMK → VMK decrypts FVEK → OS volume transparently decrypted
+If any measured component changes → TPM refuses → BitLocker Recovery screen (needs recovery password)
+```
+With **TPM + PIN** a pre-boot PIN is required, which defeats attacks where the TPM auto-releases the key to an attacker-controlled boot (for example, sniffing the SPI/LPC bus, DMA, or boot-path attacks like *bitpixie*, which downgrades the boot manager via PXE).
+
+### 3.4.3 Recovery Key Management
+- 48-digit **recovery password** (8 groups of 6 digits), with a **Key ID** that identifies it. Needed after hardware changes, BIOS/Secure Boot changes, repeated wrong PINs, or TPM clearing.
+- **Escrow locations:** Active Directory (`msFVE-RecoveryInformation` objects under the computer object), **Entra ID** (`BackupToAAD-BitLockerKeyProtector`), Microsoft account, MBAM / Intune, file/USB/print.
+- **Best practices:** require escrow *before* encryption (GPO: *Do not enable BitLocker until recovery information is stored in AD DS*), restrict who may read recovery keys (delegated ACL, audit access), rotate a recovery password after use (`Rotate BitLocker recovery key` Intune action), and test recovery procedures.
+
+```powershell
+manage-bde -status
+Enable-BitLocker -MountPoint C: -EncryptionMethod XtsAes256 -TpmAndPinProtector -Pin (Read-Host -AsSecureString) -UsedSpaceOnly
+Add-BitLockerKeyProtector -MountPoint C: -RecoveryPasswordProtector
+(Get-BitLockerVolume C:).KeyProtector
+BackupToAAD-BitLockerKeyProtector -MountPoint C: -KeyProtectorId "{GUID}"
+Manage-bde -protectors -disable C: -RebootCount 1     # suspend protection for firmware/BIOS updates
+Get-Tpm ; tpm.msc
+```
+**Policy (GPO):** *Computer Configuration → Administrative Templates → Windows Components → BitLocker Drive Encryption* (also `HKLM\SOFTWARE\Policies\Microsoft\FVE`): require additional authentication at startup, minimum PIN length, enforce drive encryption type/method, deny write access to unencrypted removable drives.
+
+**Device Encryption (Windows Home/Pro with Microsoft account/Entra sign-in)** is an automatic, simplified BitLocker; newer Windows 11 releases enable automatic encryption on more setups.
+
+**Attack/threat summary:** cold-boot RAM attacks (mitigated by shutdown vs. sleep, memory overwrite on reset), DMA (Kernel DMA Protection, disable Thunderbolt/FireWire DMA), TPM bus sniffing, evil-maid/boot-path downgrade (Secure Boot revocations (dbx), PIN), weak/escrowed recovery keys, hibernation file and sleep (S3) risks, malicious firmware.
+
+---
+
+## 3.5 User Account Control (UAC)
+
+UAC enforces least privilege for administrators through **Admin Approval Mode (AAM)**.
+
+### 3.5.1 Split Token Mechanism
+When a member of Administrators logs on, LSASS creates **two linked tokens**:
+- **Filtered (limited) token:** admin group SIDs set to *deny-only*, high-risk privileges removed (keeps `SeChangeNotify`, `SeShutdown`, `SeUndock`, `SeIncreaseWorkingSet`, `SeTimeZone`), **Medium integrity**. Used for the shell (`explorer.exe`) and all normal processes.
+- **Full (elevated) token:** all groups and privileges, **High integrity**. Used only after consent.
+
+### 3.5.2 Elevation Flow
+```
+User launches app requiring admin (manifest requestedExecutionLevel=requireAdministrator, or "Run as administrator")
+ → ShellExecute / CreateProcess fails with ERROR_ELEVATION_REQUIRED
+ → Application Information service (AppInfo, svchost) receives the request via RPC
+ → AppInfo launches consent.exe (as SYSTEM) 
+ → Consent UI shown (on the Secure Desktop if configured)
+      • Admin user: "Consent prompt" (Yes/No)
+      • Standard user: "Credential prompt" (admin username/password)
+ → On approval AppInfo creates the process with the FULL token (CreateProcessAsUser), parent set to the requester
+```
+- **Secure Desktop:** `consent.exe` runs on a separate, isolated desktop (`Winlogon` desktop) that user-mode processes (even same-user, medium IL) cannot interact with, preventing spoofed clicks, screen capture, or synthetic input to the prompt. The screen dims as the desktop is switched.
+- **Manifest execution levels:** `asInvoker`, `highestAvailable`, `requireAdministrator`. Legacy apps without manifests get **installer detection** heuristics (names like `setup.exe`) and **file/registry virtualization** (writes to `Program Files` / `HKLM\Software` redirected to per-user `VirtualStore`).
+- **Auto-elevation:** certain signed Microsoft binaries in trusted directories with `autoElevate=true` in the manifest (for example, `fodhelper.exe`, `eventvwr.exe`, `sdclt.exe`) elevate **without a prompt** under the default slider setting. This design is the basis of many **UAC bypasses** (registry hijack of `ms-settings\shell\open\command`, COM hijack, DLL side-loading, token manipulation). Microsoft's servicing policy: **UAC is not a security boundary** (bypasses are defense-in-depth issues, not CVE-class), whereas **admin → kernel/SYSTEM** is also treated as not a boundary. Hence, treat any admin-level process as potentially compromised and use standard-user accounts for daily work.
+- **Administrator protection (Windows 11, newer builds):** a newer model where elevation uses a separate, system-managed hidden admin account profile, with Windows Hello authentication and just-in-time token. Treat as an evolving feature and verify availability.
+
+### 3.5.3 Policy Settings (`Security Settings → Local Policies → Security Options` / `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System`)
+
+| Policy | Registry Value | Notes |
+|--------|----------------|-------|
+| Run all administrators in Admin Approval Mode | `EnableLUA = 1` | Disabling turns UAC (and many Store app features) off, so don't |
+| Behavior of elevation prompt for **administrators** | `ConsentPromptBehaviorAdmin` | 0 = elevate without prompting; 1 = prompt for credentials on secure desktop; 2 = prompt for consent on secure desktop; **5 = consent for non-Windows binaries (default)**; 3/4 = prompt on normal desktop variants |
+| Behavior for **standard users** | `ConsentPromptBehaviorUser` | 0 = auto-deny; 1 = credentials on secure desktop; 3 = credentials (normal desktop) |
+| Switch to the secure desktop when prompting | `PromptOnSecureDesktop = 1` | Disable only for remote-assistance scenarios |
+| Detect application installations and prompt | `EnableInstallerDetection` | |
+| Only elevate executables that are signed and validated | `ValidateAdminCodeSignatures` | PKI enforcement |
+| Only elevate UIAccess apps installed in secure locations | `EnableSecureUIAPaths` | |
+| Virtualize file and registry write failures | `EnableVirtualization` | |
+| Admin Approval Mode for the built-in Administrator | `FilterAdministratorAccount` | Built-in RID-500 account is exempt by default |
+| Remote UAC / filtering for network logons | `LocalAccountTokenFilterPolicy` (0 = filter, 1 = full token for local admins over network) | Setting to 1 enables **pass-the-hash for all local admins** (lateral movement) |
+
+**Slider mapping:** *Always notify* (secure desktop, includes Windows setting changes) → *Notify only when apps try to make changes (default)* → *same but without dimming* → *Never notify* (not recommended; with UAC enabled, still isolates tokens but removes prompts).
+
+*Hint: UAC is not the same as "run as admin".* Elevation changes the token, not the user.
+
+---
+
+## 3.6 Windows Hello & Windows Hello for Business
+
+### 3.6.1 Concepts
+- **Windows Hello:** consumer/local biometric or PIN sign-in. Hello **does not store or transmit the password**. The user gesture (PIN, face, fingerprint) simply *unlocks a private key* held locally.
+- **Windows Hello for Business (WHfB):** enterprise version that registers the key with an identity provider (**AD DS or Entra ID**) for passwordless, **phishing-resistant** multi-factor authentication (**something you have**, the device-bound key, plus **something you know/are**, PIN or biometric).
+
+### 3.6.2 Asymmetric Cryptography and TPM-Bound Keys
+```
+Provisioning (after MFA enrollment):
+  Device generates an asymmetric key pair inside the TPM (preferred; software KSP fallback)
+  Private key never leaves TPM (non-exportable). Public key registered with IdP
+     • Entra ID: stored on user object (device-registered key / NGC key)
+     • On-prem AD: msDS-KeyCredentialLink attribute (key trust) or enrolled certificate (certificate trust)
+Authentication:
+  1. Client requests a nonce/challenge from IdP (Entra ID) / DC (Kerberos PKINIT).
+  2. User gesture (PIN/biometric) authorizes TPM to use the private key.
+  3. Client signs the nonce with the private key.
+  4. IdP verifies the signature with the registered public key → issues PRT/TGT.
+```
+- **PIN ≠ password:** The PIN is **device-specific**, validated by the TPM (with **anti-hammering** lockout), and useless on any other device; a stolen PIN cannot be used remotely. It may be complex (digits, letters, symbols).
+- **Biometrics:** templates are stored **locally**, encrypted, and never leave the device; matching occurs in a secure sensor/driver stack. **Enhanced Sign-in Security (ESS)** isolates biometric sensor data and matching in VBS/TEE-protected paths with ESS-capable hardware (IR cameras, fingerprint sensors with match-on-chip), preventing sensor spoofing and driver tampering. IR cameras with liveness/anti-spoof checks provide the "Face ID"-style Windows Hello Face.
+- **Fallback:** PIN is always available if biometrics fail.
+
+### 3.6.3 Deployment Models (WHfB)
+
+| Model | Trust Mechanism | PKI? | Notes |
+|-------|----------------|------|-------|
+| **Cloud Kerberos trust** | Entra Kerberos issues partial TGT; DC converts to full | No | **Recommended** for hybrid; easiest |
+| **Key trust** | Public key in `msDS-KeyCredentialLink`; DC needs certificate (KDC auth cert) | DC certs only | Hybrid |
+| **Certificate trust** | AD CS issues user auth certificate | Full PKI/NDES | Required for some RDP/legacy scenarios |
+
+### 3.6.4 FIDO2 and Passkeys
+- **FIDO2 = WebAuthn (browser/API, W3C) + CTAP2 (authenticator protocol)**. A roaming hardware key (YubiKey, etc.) or platform authenticator generates **per-site key pairs**, with origin binding that defeats phishing and AiTM proxies.
+- Windows 10/11 support FIDO2 security keys for Entra ID sign-in (including passwordless on Entra-joined PCs) and for web apps; Windows Hello itself acts as a **platform FIDO2 authenticator**. Windows 11 added native **passkey** management (settings → Accounts → Passkeys), and plugin-authenticator support.
+- Policy controls: Hello for Business via Intune/GPO (`Use Windows Hello for Business`, `Require security device (TPM)`, PIN complexity, `Use biometrics`), and Entra *Authentication methods* policy for FIDO2/passkeys, plus Conditional Access **authentication strength** (phishing-resistant MFA).
+
+```cmd
+dsregcmd /status            :: NgcSet : YES means a Hello container exists
+certutil -DeleteHelloContainer   :: reset the Hello container (troubleshooting)
+```
+
+---
+
+## 3.7 Application Control & Modern Hardening
+
+### 3.7.1 WDAC (App Control for Business) vs. AppLocker
+
+**Windows Defender Application Control (WDAC)**, since rebranded **App Control for Business**, enforces code integrity policies through the **kernel Code Integrity (CI) engine**: it covers drivers, user-mode binaries, DLLs, scripts (via script hosts that call `WldpQuerySecurityPolicy`/`WldpGetLockdownPolicy`, for example PowerShell Constrained Language Mode), MSI, and packaged apps. Policies can be signed; with **HVCI** the policy can be shielded from tampering.
+
+**Policy building blocks:**
+- **Rules (levels):** `Hash`, `FileName`, `FilePublisher`, `Publisher`, `PCACertificate`, `SignedVersion`, `FilePath`, `WHQL`, plus **Managed Installer** (trust software deployed by MECM/Intune) and **Intelligent Security Graph (ISG)** (cloud reputation) trust.
+- **Policy rule options (selected):** `0` Enabled:UMCI (user-mode enforcement), `3` Audit Mode, `6` Unsigned System Integrity Policy, `9` Advanced Boot Options Menu, `11` Disabled:Script Enforcement, `13` Managed Installer, `14` ISG Authorization, `16` Update Policy No Reboot, `17` Allow Supplemental Policies, `19` Dynamic Code Security.
+- **Multiple Policy Format:** *base* policies plus *supplemental* policies (extend allow-lists) and deny policies. Up to 32 active policies.
+- **Microsoft recommended block rules** (LOLBins: `msbuild.exe`, `mshta.exe`, `wmic`, etc.) and **driver block rules** can be merged in.
+
+**Workflow:**
+```powershell
+# 1. Create policy from a reference ("gold") system, audit mode first
+New-CIPolicy -Level FilePublisher -Fallback Hash -FilePath .\Base.xml -UserPEs -ScanPath C:\ 
+# Or start from a template: C:\Windows\schemas\CodeIntegrity\ExamplePolicies\{AllowMicrosoft,DefaultWindows_Audit,...}.xml
+Set-RuleOption -FilePath .\Base.xml -Option 3            # audit mode
+ConvertFrom-CIPolicy .\Base.xml .\{PolicyGUID}.cip       # binary policy
+# 2. Deploy (Win11 22H2+/Server 2025): 
+CiTool.exe --update-policy .\{PolicyGUID}.cip
+#    or copy to C:\Windows\System32\CodeIntegrity\CiPolicies\Active\ ; or Intune (OMA-URI / App Control profile) / GPO
+# 3. Review events in Microsoft-Windows-CodeIntegrity/Operational (3076 audit, 3077 block) and
+#    Microsoft-Windows-AppLocker/MSI and Script (script), then refine → switch to enforced (remove option 3)
+```
+Tooling: **App Control Wizard** (GUI), `CiTool.exe --list-policies`. Also, **Event 3089** records signing info for events 3076/3077.
+
+**AppLocker (legacy):** user-mode only; policy applied via **GPO/MDM** to a specific user/group SID, evaluated by the **Application Identity service (`AppIDSvc`)** and the `appid.sys` driver; rules are *Allow* (default-deny) plus *Deny* exceptions, in **collections**: Executable (`.exe/.com`), Windows Installer, Script (`.ps1/.vbs/.js/.bat/.cmd`), **DLL** (off by default; performance cost), Packaged apps (MSIX). Rule conditions: **Publisher**, **Path**, **File hash**. Events in `Microsoft-Windows-AppLocker/EXE and DLL` (8002 allowed, 8003 audit-would-block, 8004 blocked) and `MSI and Script` (8005/8006/8007).
+
+| Feature | **WDAC / App Control for Business** | **AppLocker** |
+|--------|--------------------------------------|---------------|
+| Enforcement layer | **Kernel** Code Integrity (ci.dll) + script hosts | User-mode service/driver (`AppIDSvc`, `appid.sys`) |
+| Covers kernel-mode drivers | **Yes** | No |
+| Scope | Per **device** (all users) | Per **user/group** possible |
+| Tamper resistance | Strong: signed policies, HVCI/secure boot protected, admin cannot easily override | Weaker: local admin can stop `AppIDSvc` / alter policy (unless protected by GPO + other controls) |
+| Rule types | Signer, hash, filename, path (runtime/user-writable checks), ISG, Managed Installer | Publisher, path, hash |
+| Reputation (ISG) / Managed Installer | **Yes** | No |
+| Multiple policies / supplemental | **Yes** | No (single rule set; GPO merge) |
+| Audit mode | Yes (`3076`/`3077`) | Yes (`8003`/`8006`) |
+| Management | Intune, MECM, GPO (single policy), PowerShell, `CiTool`, Wizard | GPO, Intune (CSP), PowerShell |
+| Windows SKU | All Windows 10/11 (authoring in Pro; some GPO deployment Enterprise/Education) | Enforcement requires Enterprise/Education (Pro can't enforce via GPO in older versions) |
+| Microsoft guidance | **Security feature**: recommended for new deployments | Defense-in-depth; **no new features**, still supported |
+| Bypass risks | Misconfigured allow-rules (writable paths, signed LOLBins, trusted Managed Installer abuse), unsigned policy tamper if no secure boot | User-writable allowed paths (for example `C:\Windows\Tasks`, `Temp`), LOLBins, running as admin, DLL rules off |
+
+Recommended practice: start with **audit mode**, deploy a **base + supplemental** structure, block known bypass binaries, use **signed policies** (and UEFI-lock where fitting), and keep AppLocker only where per-user rules are needed (both can coexist; WDAC wins when both apply, because they are layered and both must allow).
+
+### 3.7.2 Smart App Control (SAC)
+
+**Smart App Control** (Windows 11 22H2+) is a **consumer-oriented, prebuilt App Control policy** that blocks untrusted/unknown apps by default. It is built on WDAC and the **Intelligent Security Graph (ISG)**.
+
+**How it decides to run a binary:**
+```
+Launch → CI engine intercepts image load
+  1. Is the file signed by a certificate/signer in Microsoft's trusted signer set (valid, not abusive)?  → allow
+  2. Else ask Microsoft's cloud intelligence service (ML/"AI-driven" predictions plus reputation) → "known good" → allow
+  3. Else unsigned/unknown → block (user sees "Smart App Control blocked part of this app")
+Also blocks: apps known to be malicious/PUA, certain script hosts/macros-based abuse paths per policy,
+ and abuse-prone LOLBin configurations; applies to executables, DLLs, scripts, and installers.
+```
+- **States:** *Evaluation mode* (learns whether it will be usable for your workflow, auto-turns Off if disruptive) → **On** (enforced) or **Off**. Historically, requires a **clean install** to enter Evaluation; once turned **Off**, re-enabling traditionally required a Windows reset/reinstall (Microsoft has been changing this, so verify the current build behavior). Not available when an enterprise WDAC policy is managing the device (SAC turns off).
+- **Status check:** *Windows Security → App & browser control → Smart App Control settings*, or the registry `HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy` value **`VerifiedAndReputablePolicyState`** (`0` = Off, `1` = On/enforce, `2` = Evaluation).
+- **Pros:** blocks unsigned commodity malware and trojanized installers *without* admin policy engineering; works with Microsoft Defender SmartScreen (Mark-of-the-Web based reputation) and Defender.
+- **Cons/trade-offs:** blocks legitimate unsigned developer tools/internal apps (developers should use Dev Drive/signed builds or turn off), requires cloud connectivity for reputation lookups, not manageable at fine granularity, and signed-but-abusable binaries can still be misused (hence layering with ASR/EDR).
+- **Enterprise stance:** use **WDAC/App Control for Business** (centrally managed, auditable) instead of SAC, and use SmartScreen + Defender protections.
+
+---
+
+# 4. Layered Defense Summary & Hardening Checklist
+
+## 4.1 How the Technologies Fit Together
+
+```
+HARDWARE & FIRMWARE:  TPM 2.0 / Pluton · UEFI Secure Boot · Measured Boot · IOMMU/Kernel DMA Protection · SMM/DRTM
+HYPERVISOR (VBS):     VTL1 Secure Kernel · HVCI (W^X kernel, driver blocklist) · Credential Guard (LsaIso)
+KERNEL / OS CORE:     SRM access checks · Tokens + MIC integrity levels · PatchGuard · DSE · PPL (LSASS) 
+IDENTITY:             Kerberos > NTLM · Windows Hello for Business / FIDO2 · Entra ID + Conditional Access · LAPS
+EXECUTION CONTROL:    WDAC/App Control · AppLocker · Smart App Control · Exploit Protection (DEP/ASLR/CFG/CET)
+ENDPOINT PROTECTION:  Defender AV · ASR rules · Network Protection · Controlled Folder Access · EDR · Tamper Protection
+DATA PROTECTION:      BitLocker (TPM+PIN) · DPAPI · EFS · recovery key escrow
+ADMIN HYGIENE:        UAC (AAM) · least privilege · tiered admin · Protected Users · auditing/SIEM
+```
+
+## 4.2 Baseline Hardening Checklist
+
+- [ ] Secure Boot + TPM 2.0 enabled; UEFI password set; boot order locked
+- [ ] BitLocker with **TPM + PIN** (XTS-AES 256 where policy requires), recovery keys escrowed (AD/Entra)
+- [ ] **VBS + HVCI (Memory Integrity)** enabled; incompatible drivers remediated; Vulnerable Driver Blocklist on
+- [ ] **Credential Guard** enabled (UEFI lock for high-value endpoints); LSA Protection (`RunAsPPL`) on
+- [ ] WDigest disabled; NTLMv1/LM disabled (`LmCompatibilityLevel=5`); SMB signing required; SMBv1 removed; LDAP signing + channel binding
+- [ ] UAC enabled at default or higher; no `LocalAccountTokenFilterPolicy=1`; daily-use accounts are standard users
+- [ ] Windows LAPS deployed for local administrator passwords
+- [ ] ASR rules in Block (after Audit tuning); Network Protection + Controlled Folder Access on; Tamper Protection on
+- [ ] Exploit Protection system defaults (DEP/ASLR/CFG/SEHOP) + per-app hardening for Office, PDF readers, browsers
+- [ ] WDAC/App Control base policy (audit → enforce) with recommended block rules; AppLocker only if needed
+- [ ] Windows Hello for Business / FIDO2 passkeys rolled out; legacy password-only sign-in reduced
+- [ ] Advanced Audit Policy configured (logon, process creation 4688 with command line, object access, privilege use, policy change); logs forwarded to SIEM (also Sysmon)
+- [ ] Patch management (monthly cumulative updates; WSUS/Intune rings); remove unnecessary features (PowerShell v2, SMB1, legacy protocols)
+- [ ] Benchmarks applied: Microsoft Security Baselines (via Security Compliance Toolkit), CIS Benchmarks, DISA STIGs
+
+## 4.3 Useful Verification Commands (Cheat Sheet)
+
+```powershell
+# Identity and tokens
+whoami /all
+klist ; dsregcmd /status
+# VBS / HVCI / Credential Guard
+Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard -ClassName Win32_DeviceGuard
+msinfo32
+# LSA protection
+reg query HKLM\SYSTEM\CurrentControlSet\Control\Lsa /v RunAsPPL
+# Defender / ASR / CFA / Network Protection
+Get-MpComputerStatus
+Get-MpPreference | fl AttackSurfaceReductionRules*, EnableControlledFolderAccess, EnableNetworkProtection
+# BitLocker / TPM
+manage-bde -status ; Get-Tpm
+# Process mitigations
+Get-ProcessMitigation -System
+# Code integrity events
+Get-WinEvent -LogName "Microsoft-Windows-CodeIntegrity/Operational" -MaxEvents 20
+# Smart App Control
+reg query HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy /v VerifiedAndReputablePolicyState
+# UAC settings
+reg query HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System
+```
+
+---
+
+# 5. Quick Review Questions
+
+1. Describe each step of a `syscall` from `kernel32!ReadFile` to the kernel. Where does the SRM get involved?
+2. Why is a **NULL DACL** different from an **empty DACL**? Which is dangerous?
+3. Explain how a **filtered token** and a **full token** differ in a UAC split token, and why UAC is not a security boundary.
+4. A server thread impersonates a client at **Identification** level. What can and can't it do?
+5. How does **HVCI** enforce W^X on kernel memory even if an attacker has an arbitrary kernel write primitive?
+6. What does **Credential Guard** protect against, and which attacks does it *not* stop?
+7. Walk through the **BitLocker key hierarchy** (FVEK → VMK → protectors). Why does TPM+PIN defeat attacks that TPM-only does not?
+8. Compare **NTLM** and **Kerberos**: authentication flow, mutual authentication, delegation, and attacks for each.
+9. What is the **PRT**, how is it protected, and how can it be abused?
+10. Compare **WDAC** and **AppLocker** on enforcement layer, tamper resistance, and driver coverage. When would you use each?
+11. Which ASR rules most directly interrupt the macro-malware kill chain? Which ones commonly break management tools?
+12. How does **Smart App Control** decide whether to allow an unsigned binary, and why is it unsuitable for managed enterprise fleets?
+13. Why does Windows Hello's PIN differ from a password in threat-model terms?
+14. List five privileges that enable privilege escalation and explain how each is abused.
+
+---
+
+*End of Unit 1 notes. For lab practice: enable ASR in audit mode and review events 1122; build a WDAC audit policy and read events 3076; enable RunAsPPL and attempt a LSASS dump (in a lab VM); inspect tokens with Process Explorer/`whoami /all`; examine SDDL with `icacls` and `Get-Acl`; and trace a Kerberos exchange with `klist` and Wireshark.*
