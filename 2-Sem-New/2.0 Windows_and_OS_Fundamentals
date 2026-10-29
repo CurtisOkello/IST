@@ -1,0 +1,1050 @@
+# WINDOWS FUNDAMENTALS: The Absolute Beginner's Guide
+
+### Welcome! 👋
+
+You do **not** need to know anything about operating systems to use these notes. Every technical word is explained **the moment it appears**, usually with an everyday comparison. If a word shows up again later, you will see a quick reminder.
+
+**How the notes work**
+- **Bold** words are new terms being defined.
+- 🏠 **Analogy** boxes give you a real-world picture.
+- 🔍 **Why it matters** boxes tell you why a security person or IT admin cares.
+- Commands are shown in code blocks. You do not have to memorise them. They are there so you can try things on a practice computer later.
+
+> **Tip:** Do not try to learn everything in one sitting. Read one section, try the small exercise at the end, then continue.
+
+---
+
+## Table of Contents
+
+1. [The Windows Boot Process & System Architecture](#1-the-windows-boot-process--system-architecture)
+2. [Processes, Threads, and Memory](#2-processes-threads-and-memory)
+3. [Identity, Authentication, and Access Control](#3-identity-authentication-and-access-control)
+4. [Networking and Service Architecture](#4-networking-and-service-architecture)
+5. [Windows Administrative & Triage Tools](#5-windows-administrative--triage-tools)
+6. [Glossary (A-Z)](#6-glossary-a-z)
+7. [Practice Exercises](#7-practice-exercises)
+
+---
+
+# 1. The Windows Boot Process & System Architecture
+
+## 1.1 The Core Foundation
+
+### What is an operating system (OS)?
+An **operating system** is the main program that manages a computer's hardware (screen, keyboard, disk, memory, network card) and lets other programs (a browser, a game, Word) use that hardware without needing to know how it works. **Windows** is one operating system. Others are macOS, Linux, Android, and iOS.
+
+🏠 **Analogy: a restaurant manager.** The kitchen (hardware) can cook food, and the customers (apps) want meals. The manager (the OS) takes orders, decides who gets served first, keeps customers out of the kitchen, and makes sure that nobody steals from the cash register.
+
+### What is hardware vs. software?
+- **Hardware:** the physical parts you can touch (CPU, memory, hard drive, screen).
+- **Software:** programs, which are just instructions stored as files.
+
+### Key hardware words
+| Term | Plain-English meaning |
+|------|----------------------|
+| **CPU** (Central Processing Unit) | The "brain" that follows program instructions, billions per second. |
+| **RAM** (Random Access Memory), or "memory" | Fast, temporary workspace that holds whatever you are using *right now*. Wiped when power goes off. |
+| **Disk / SSD / hard drive** (storage) | Long-term storage where files, apps, and Windows itself are kept, even when powered off. |
+| **Driver** | A small translator program that teaches the OS how to talk to one specific piece of hardware (printer, graphics card). |
+
+### What is firmware?
+**Firmware** is a tiny, permanent program stored on a chip on the motherboard (the computer's main circuit board). It is the very first thing that runs when you press the power button, *before* Windows even exists on screen. Its job is to wake up the hardware and find the operating system to start.
+
+🏠 **Analogy:** when you start a car, the key turns the starter motor *before* the engine is running. Firmware is the starter motor. It is not the engine (the OS), but the engine cannot start without it.
+
+### The two "modes" of Windows: User Mode vs. Kernel Mode
+Modern CPUs have privilege levels. Windows uses two:
+
+| Mode | Plain English | Who runs here |
+|------|---------------|---------------|
+| **User mode** | A restricted area. Programs here cannot directly touch hardware or other programs' secrets. If they crash, only they die. | Your apps (Chrome, Notepad), most background programs |
+| **Kernel mode** | The all-powerful inner circle. Code here can touch everything. If it crashes, the whole computer crashes (the "blue screen"). | The **kernel** and **drivers** |
+
+The **kernel** is the core of the operating system, the part that manages memory, programs, and hardware. In Windows it is a file called `ntoskrnl.exe`. (The `.exe` ending means "executable", a file that can run as a program.)
+
+🏠 **Analogy:** a bank. Customers (apps) wait in the lobby (user mode). Only trained staff (the kernel) are allowed in the vault (kernel mode). If customers want something from the vault, they make a formal request at the counter, called a **system call**.
+
+🔍 **Why it matters:** Attackers dream of getting code into kernel mode, because from there they can do anything. A lot of Windows security exists to protect that inner circle.
+
+---
+
+## 1.2 Firmware and Boot Initialization
+
+**Booting** (short for "bootstrapping", as in "pulling yourself up by your bootstraps") is the process of starting a computer and getting the OS running.
+
+### BIOS vs. UEFI
+
+There are two kinds of firmware you might meet:
+
+| | **Legacy BIOS** | **UEFI** |
+|--|-----------------|----------|
+| Stands for | **B**asic **I**nput/**O**utput **S**ystem | **U**nified **E**xtensible **F**irmware **I**nterface |
+| Age | Very old (1980s design) | Modern replacement (standard since ~2010s) |
+| Looks | Plain blue/grey text menus | Often graphical, mouse-friendly |
+| Speed | Slower startup | Faster startup |
+| Disk size supported for booting | Up to about 2 TB | Huge (billions of TB) |
+| Security gatekeeper (Secure Boot) | ❌ No | ✅ Yes |
+| Windows 11 | ❌ Not supported | ✅ Required |
+
+🏠 **Analogy:** BIOS is a paper checklist from the 1980s. UEFI is a modern smart assistant that can also check IDs at the door.
+
+### MBR vs. GPT (how a disk is divided up)
+
+A **partition** is a section of a disk, like dividing one big room into smaller rooms with walls. You might have one partition for Windows, one for recovery tools, and so on. A **partition table** is the "floor plan" that records where each partition begins and ends.
+
+| | **MBR** (Master Boot Record) | **GPT** (GUID Partition Table) |
+|--|------------------------------|---------------------------------|
+| Age | Old (1983) | Modern |
+| Used with | Legacy BIOS | UEFI |
+| Max partitions | 4 primary | 128 by default |
+| Max disk size | 2 TB | Practically unlimited |
+| Safety | One copy of the floor plan: damage it and the disk may become unreadable | **Two copies** (start and end of disk) plus error-checking (a **checksum**, a quick math test that detects corruption) |
+| Where the "GUID" comes from | – | A **GUID** is a Globally Unique Identifier, a very long random-looking ID such as `{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}` that is practically never repeated anywhere in the world |
+
+**Typical modern Windows disk (UEFI + GPT) has:**
+1. **EFI System Partition (ESP)**: a small partition holding the files needed to start the boot. Think of it as the "ignition keys box".
+2. **MSR** (Microsoft Reserved): a tiny hidden partition Windows keeps for internal use.
+3. **The Windows partition** (usually drive `C:`) formatted as **NTFS** (New Technology File System: the way Windows organises files on disk, including permissions and security).
+4. **Recovery partition**: repair tools in case Windows breaks.
+
+### Secure Boot: the computer's gatekeeper
+**Secure Boot** is a UEFI feature that checks the **digital signature** of every program involved in startup and refuses to run anything untrusted.
+
+- A **digital signature** is like a tamper-proof wax seal on a letter: it proves *who* made the file and that nobody has changed it since. It is created with **cryptography** (math-based secret codes).
+- Secure Boot keeps lists in the firmware: a list of **allowed** signers and a list of **revoked** (banned) ones. If a boot file isn't on the allowed list, or has been tampered with, the computer stops.
+- A **root of trust** is the starting point you must trust without proof. In Secure Boot, that is the firmware's built-in list of trusted keys. Every later step is trusted *only because the step before verified it*, like a chain of "I vouch for this person".
+
+🏠 **Analogy:** a nightclub bouncer. Everyone who wants in must show valid ID. The bouncer isn't asked to prove *his own* trustworthiness, because he's trusted by the club's owner (the root of trust).
+
+🔍 **Why it matters:** Malware called a **bootkit** or **rootkit** (hidden malware that starts *before* or *beneath* the OS so it can hide from security tools) is blocked, because it can't present a valid signature.
+
+### TPM and Measured Boot (a bonus)
+- A **TPM** (Trusted Platform Module) is a small security chip that stores secrets (like disk-encryption keys) and can't be easily tampered with. Windows 11 requires TPM 2.0.
+- **Measured Boot** means each boot stage *records a fingerprint* (a **hash**: a short code computed from a file that changes completely if even one bit of the file changes) of the next stage into the TPM. Secure Boot *blocks* bad stuff; Measured Boot *writes it in a log*.
+
+### Try it
+```powershell
+msinfo32                        # Opens System Information: look for "BIOS Mode" (UEFI) and "Secure Boot State"
+Get-Disk | Select Number, PartitionStyle   # Shows GPT or MBR  (PowerShell is Windows' command-line tool; see Section 5)
+```
+
+---
+
+## 1.3 The Complete Boot Chain
+
+Think of the boot as a **relay race**: each runner passes the baton to the next. Here is the whole race.
+
+```
+Power button
+   ↓
+1. Firmware (UEFI)          → wakes hardware, runs self-check, checks Secure Boot
+   ↓
+2. Windows Boot Manager     → bootmgfw.efi  (decides which Windows to start)
+   ↓
+3. Windows OS Loader        → winload.efi   (loads the kernel & key drivers into RAM)
+   ↓
+4. The Kernel               → ntoskrnl.exe  (takes control; sets up the system)
+   ↓
+5. Session Manager          → smss.exe      (sets up "sessions", starts helpers)
+   ↓
+6a. csrss.exe   6b. wininit.exe   6c. winlogon.exe
+   ↓                 ↓                    ↓
+ (basic Windows   services.exe        Login screen
+  plumbing)       lsass.exe
+                  (background services)
+   ↓
+7. You log in → explorer.exe → your desktop appears
+```
+
+### Step by step
+
+**Step 1: Firmware (UEFI) starts.** You press the power button. Power flows, and the CPU starts running firmware. This does the **POST** (Power-On Self-Test): a quick health check (is the RAM okay? Is a keyboard there?). Secure Boot checks begin. The firmware then looks at its list of boot options and finds the **Windows Boot Manager** on the EFI System Partition.
+
+**Step 2: Windows Boot Manager (`bootmgfw.efi`).** A small program whose job is to choose *what* to boot (useful if two operating systems are installed). It reads the **BCD** (Boot Configuration Data), a small settings file that says things like "Windows is installed here" and "start in normal mode vs. Safe Mode". If the drive is encrypted with **BitLocker** (Windows' built-in disk encryption, which scrambles the disk so thieves can't read it), the unlocking happens around here, using the TPM.
+
+**Step 3: Windows OS Loader (`winload.efi`; on old BIOS systems `winload.exe`).** Its job: pull the essential parts of Windows off the disk and into RAM. That includes:
+- the kernel (`ntoskrnl.exe`),
+- the **HAL** (`hal.dll`): the **Hardware Abstraction Layer**, a thin translator layer so Windows works across many different hardware designs. A **DLL** is a shared library file; defined fully in Section 2.4,
+- the **SYSTEM registry hive** (settings; see 1.4),
+- **boot-start drivers**: must-have drivers, such as the one that reads the disk.
+`winload` also checks digital signatures on all of these (Secure Boot's chain continues) and starts an **ELAM** driver, an *Early Launch Anti-Malware* driver, a tiny antivirus that gets to inspect other drivers before they load.
+
+**Step 4: The Kernel (`ntoskrnl.exe`) takes over.** The kernel sets up memory management, the security system, and the I/O (input/output) system. It then creates the very first "program": the **System process** (Section 2.2), and launches the first normal program, `smss.exe`.
+
+**Step 5: `smss.exe` (Session Manager Subsystem).**
+- A **session** is a separate, isolated "workspace" for a login. **Session 0** is reserved for background system stuff. **Session 1** (and higher) is for people who log in at the keyboard.
+- `smss.exe` creates these sessions. For each, it starts a helper: `csrss.exe` plus either `wininit.exe` (Session 0) or `winlogon.exe` (Session 1+).
+- It also sets up the **page file** (spare memory space on disk, see 2.4), and does early housekeeping such as a disk check.
+- After launching helpers for a session, that session's `smss.exe` copy **quits**. That is why its children appear to have no parent in some tools (explained in Section 2.2).
+
+**Step 6a: `csrss.exe` (Client/Server Runtime Subsystem).** The basic "plumbing" for the Windows program environment: it helps manage console (text) windows and keeps track of processes and threads. One copy per session. It is *so* essential that if it is killed, Windows crashes.
+
+**Step 6b: `wininit.exe` (Windows Initialization), Session 0.** The "background team's foreman". It starts two vital programs:
+  - **`services.exe`**: the **Service Control Manager**. It starts all **services** (background programs, see Section 4.1).
+  - **`lsass.exe`**: the **Local Security Authority Subsystem Service**, Windows' security guard and password checker (Section 2.2/3).
+
+**Step 6c: `winlogon.exe` (Windows Logon), Session 1+.** Handles the login screen. It shows the sign-in interface (via `LogonUI.exe`), hands your password to `lsass.exe` to be checked, and, once you're approved, starts your personal environment.
+
+**Step 7: Your desktop.** After a successful login, `winlogon` runs `userinit.exe` (a helper that sets up your logon, then exits), which starts **`explorer.exe`**: the program that draws your desktop, taskbar, and Start menu. Startup apps you configured then launch.
+
+**Step 8: Background initialisation.** Services marked "Delayed start", scheduled tasks, and security software finish loading while you are already using the PC.
+
+🔍 **Why it matters:** Each handoff is a place where attackers try to sneak in ("persistence": making malware survive reboots). Defenders know the *normal* chain, so anything that doesn't fit stands out.
+
+### Other boot facts
+- **Safe Mode:** a stripped-down start with only basic drivers, for fixing problems.
+- **Fast Startup:** a Windows feature where "Shut down" actually saves part of the system state to a file (`hiberfil.sys`) for quicker next start. A true clean start requires **Restart**.
+- **WinRE** (Windows Recovery Environment): the built-in repair toolkit.
+
+---
+
+## 1.4 The Windows Registry (The OS Hive)
+
+### What is it?
+The **Registry** is a giant, organised database where Windows and programs store their **settings**: your wallpaper, which programs start with Windows, how a service is configured, and thousands of other options.
+
+🏠 **Analogy:** a central filing cabinet for the whole computer. Each **drawer** is a major section, each **folder** inside is a **key**, and each **sheet of paper** is a **value** (one setting with a name and its data). It is also like a nervous system: nearly every part of Windows checks it constantly for instructions.
+
+**Vocabulary**
+| Term | Meaning |
+|------|---------|
+| **Key** | A folder in the registry (can contain other keys and values). |
+| **Value** | One setting inside a key: it has a **name**, a **type** (text, number, binary data...), and **data**. |
+| **Hive** | A big branch of the registry that is saved as one file on disk. |
+
+### The five root "drawers" (called root keys)
+
+| Root key | Short name | Plain English |
+|----------|-----------|----------------|
+| `HKEY_LOCAL_MACHINE` | **HKLM** | Settings for the **whole computer**: hardware, Windows itself, services, installed software. Affects *every* user. |
+| `HKEY_CURRENT_USER` | **HKCU** | Settings for the **person currently logged in**: their wallpaper, their personal app settings. Affects only them. |
+| `HKEY_USERS` | **HKU** | Settings for **all** users who have a profile loaded. HKCU is a shortcut to *your* section here. |
+| `HKEY_CLASSES_ROOT` | **HKCR** | Says what program opens what file type (`.pdf` opens with Adobe/Edge). It is a combined view of two other places. |
+| `HKEY_CURRENT_CONFIG` | **HKCC** | Info about the current hardware setup. A shortcut. |
+
+**Key insight:** only **HKLM** and **HKU** are "real". The other three are shortcuts or combined views of them.
+
+**Where the registry lives on disk (the files):**
+| File | Holds |
+|------|-------|
+| `C:\Windows\System32\config\SYSTEM` | Core system and service settings |
+| `...\config\SOFTWARE` | Installed software settings |
+| `...\config\SAM` | Local user accounts (password fingerprints, **hashes**, see Section 3) |
+| `...\config\SECURITY` | Security policy and secrets |
+| `C:\Users\<name>\NTUSER.DAT` | That user's personal settings (becomes HKCU) |
+
+### Important spots to know
+- **Auto-start locations ("Run keys")**: programs listed here launch automatically at login.
+  ```
+  HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run        ← starts for every user
+  HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run        ← starts only for the current user
+  ...\RunOnce                                              ← starts once, then deletes itself
+  ```
+- **Services list:** `HKLM\SYSTEM\CurrentControlSet\Services`. Every service has a key here.
+
+🔍 **Why it matters:** **Persistence** means malware arranging to run again after every restart. Adding itself to a Run key is the oldest trick. Admins check these keys to hunt for it. Because HKCU doesn't need administrator rights to edit, even a low-privilege attacker can use it.
+
+### Try it
+```cmd
+reg query HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run
+```
+(You can also open **Registry Editor** by pressing Win+R, typing `regedit`. **Look but don't change anything** until you've learned more. Mistakes here can break Windows.)
+
+---
+
+# 2. Processes, Threads, and Memory
+
+## 2.1 Processes and Threads
+
+### What is a program vs. a process?
+A **program** is a file sitting on disk: instructions, not doing anything. A **process** is a program that is **running**: Windows has loaded it into memory and given it resources.
+
+🏠 **Analogy:** A **recipe** is a program. A **kitchen actively cooking that recipe** is a process.
+
+### What is a process, exactly?
+A **process** is an independent **workspace** (like a factory) containing:
+- its own private chunk of memory,
+- the program's code,
+- a list of **handles** (a handle is a numbered "ticket" the process holds to use something, like an open file),
+- an **access token** (a digital ID badge; Section 3),
+- one or more threads.
+
+Each process gets a **PID** (Process ID): a unique number, like an employee ID, so Windows can tell processes apart.
+
+### What is a thread?
+A **thread** is a single line of work inside a process, one sequence of instructions being carried out. A process has at least one thread, and can have many.
+
+🏠 **Analogy:** A process is a **factory building**. Threads are the **workers** inside. Workers in the same factory share its tools and storage (memory), but each works on their own task. A web browser might have one worker loading the page, one playing the video, and one watching your keyboard.
+
+**Important:** the process is the *container*. **Threads are what actually run on the CPU.**
+
+### Multitasking and scheduling
+A modern CPU has several **cores** (independent mini-brains), but you might have 300 threads wanting to run. So Windows uses **multitasking**: switching between threads so fast that everything *seems* to run at the same time.
+
+- The **scheduler** is the part of the kernel that decides *which thread runs on which core, and for how long*.
+- Each thread gets a short time slice (a **quantum**, typically a few milliseconds). When time is up, or a more important thread arrives, the scheduler pauses it and runs another. This swap is called a **context switch** (saving where one worker was, loading where the next one left off, like bookmarking pages in two books).
+- Threads have **priorities** (0-31). Higher priority threads go first. Normal apps use mid-range priorities; very high "real-time" priorities are reserved for special cases, as they can starve everything else.
+- This approach is **preemptive**: the scheduler can interrupt a thread whenever it needs to, so one frozen app can't hog the whole machine.
+
+🏠 **Analogy:** a single teacher helping a class: spends a few minutes with each student in turn, but a student with an urgent question can interrupt (higher priority).
+
+### Try it
+```powershell
+Get-Process | Select -First 10 Name, Id, Threads     # Id = PID; Threads = number of workers
+```
+
+---
+
+## 2.2 Critical Windows Processes (The Normal Baseline)
+
+A **baseline** is a description of "what normal looks like". If you know what's normal, you can spot what's wrong. This matters because malware often **masquerades** (pretends to be) as a trusted Windows process, using similar names, such as `scvhost.exe` instead of `svchost.exe`.
+
+For each process, check **five things**:
+1. **Name**, spelled correctly.
+2. **Path**, the folder it runs from (usually `C:\Windows\System32`, the main folder for Windows' own programs).
+3. **Parent**, the process that started it. (A **parent process** launches a **child process**, giving a family tree.)
+4. **User account**, who it runs as.
+5. **How many copies** should exist.
+
+### The baseline table
+
+| Process | Normal path | Normal parent | Runs as | How many? |
+|---------|-------------|---------------|---------|-----------|
+| **System** (PID **4**) | none (it's the kernel itself) | none / System Idle | SYSTEM | Exactly 1 |
+| **smss.exe** | `C:\Windows\System32\smss.exe` | System | SYSTEM | 1 main (helper copies vanish) |
+| **csrss.exe** | `C:\Windows\System32\csrss.exe` | none visible* | SYSTEM | 1 per session (usually 2) |
+| **wininit.exe** | `C:\Windows\System32\wininit.exe` | none visible* | SYSTEM | 1 |
+| **services.exe** | `C:\Windows\System32\services.exe` | wininit.exe | SYSTEM | 1 |
+| **lsass.exe** | `C:\Windows\System32\lsass.exe` | wininit.exe | SYSTEM | **Exactly 1** |
+| **winlogon.exe** | `C:\Windows\System32\winlogon.exe` | none visible* | SYSTEM | 1 per logged-in session |
+| **svchost.exe** | `C:\Windows\System32\svchost.exe` | services.exe | various | Many (normal) |
+| **explorer.exe** | `C:\Windows\explorer.exe` (**not** System32) | none visible* | You | Usually 1 |
+
+\* *"None visible" is normal:* the parent (a short-lived `smss.exe` or `userinit.exe` copy) already finished and exited. Tools show these as orphans (children whose parent no longer exists). That's **not** suspicious for these specific processes.
+
+### What each one does (in plain English)
+
+**`System` (PID 4).** This isn't a regular program. It is the *kernel's own work* shown as a process, home to the workers (threads) that handle things like drivers and basic networking for file sharing. It is **always PID 4** and has no file path.
+🔍 *Suspicious:* anything named "System" with a different PID, a file path, or running as a normal user.
+
+**`smss.exe` (Session Manager).** The first real program after the kernel; creates sessions and starts the helpers described in 1.3.
+🔍 *Suspicious:* several `smss.exe` that stay running, or one outside System32.
+
+**`csrss.exe` (Client/Server Runtime).** Basic Windows plumbing, one per session. Can't be killed without crashing Windows.
+🔍 *Suspicious:* runs from anywhere but System32; runs as a normal user; spelled `csrs.exe`.
+
+**`wininit.exe`.** Starts `services.exe` and `lsass.exe`. One copy.
+
+**`services.exe`.** The **Service Control Manager**: the boss of background services (Section 4.1). It is the *parent* of the many `svchost.exe` processes.
+🔍 *Suspicious:* more than one copy, or a parent other than `wininit.exe`.
+
+**`lsass.exe` (Local Security Authority Subsystem Service).** Windows' **security guard and bouncer**. It:
+- checks passwords when you log in,
+- creates your **access token** (digital VIP badge),
+- enforces security policies,
+- writes security events to the log.
+Because it keeps proof of logged-in users in its memory, it is a **top target for credential theft** (stealing passwords/hashes).
+🔍 *Suspicious:* **more than one** `lsass.exe`; look-alike names (`lsasss.exe`, or `isass.exe` with a capital "I" instead of a lowercase "l"); wrong path; wrong parent; other programs trying to read its memory.
+
+**`winlogon.exe`.** Handles logging in, logging out, and locking the screen. It also reacts to **Ctrl+Alt+Del**, the *Secure Attention Sequence*, a key combo that only Windows itself can detect, so a fake login screen can't intercept it.
+
+**`explorer.exe`.** The **Windows Shell**: this is **your desktop**: the taskbar, Start menu, File Explorer windows, and desktop icons.
+- ⚠️ **It's not a web browser!** Despite sounding like "Internet Explorer", `explorer.exe` has nothing to do with browsing the web. The old browser was `iexplore.exe`; today it's Edge (`msedge.exe`) or Chrome (`chrome.exe`). Think of `explorer.exe` as "explorer of your *files* and desktop".
+- Most apps you open from the Start menu or desktop become **children of `explorer.exe`**.
+🔍 *Suspicious:* it lives in `C:\Windows\`, **not** System32. Another copy elsewhere is a red flag. Also, `explorer.exe → winword.exe → powershell.exe` (a document launching a command shell) is a classic phishing-attack pattern.
+
+**`svchost.exe` (Service Host).** A generic "container" that runs many background services (see Section 4.1). It's normal to see dozens. A genuine one **always** has `-k` in its command line and `services.exe` as its parent.
+
+### Quick masquerading checklist
+| Check | Red flag example |
+|-------|------------------|
+| Spelling | `svch0st.exe`, `scvhost.exe`, `lsasss.exe` |
+| Path | `svchost.exe` running from `C:\Users\...\Temp` |
+| Parent | `lsass.exe` started by something other than `wininit.exe` |
+| Count | Two `lsass.exe` |
+| Account | `csrss.exe` running as a normal user |
+| Signature | A "Microsoft" file with no valid **digital signature** |
+
+### Try it
+```powershell
+Get-CimInstance Win32_Process | Where Name -in 'lsass.exe','services.exe','explorer.exe' |
+   Select ProcessId, ParentProcessId, Name, ExecutablePath
+```
+
+---
+
+## 2.3 Virtual Memory
+
+### What is memory (RAM) again?
+**RAM** is the fast temporary workspace for running programs. Imagine it as a very large wall of numbered lockers, each with a unique **address**.
+
+### What is virtual memory?
+**Virtual memory** is a trick where the OS gives **each process its own private, imaginary set of addresses**, instead of letting programs use real RAM addresses directly. The kernel quietly translates these imaginary addresses into real RAM locations using lookup tables (**page tables**) behind the scenes.
+
+🏠 **Analogy:** a hotel. Every guest thinks of "Room 101" as *their* room, but there are many different "Room 101"s: one on each floor. The front desk (the kernel's **Memory Manager**) knows which real room each guest's "101" actually points to. Guests never see each other's rooms.
+
+### Why are apps isolated from each other?
+Because each process only sees *its own* virtual addresses:
+- Process A **cannot read or change** Process B's memory by accident or on purpose (without special permission).
+- If one program crashes, it doesn't corrupt others.
+- Malware running in one process can't just peek at your banking app's data. It has to *ask* the OS for access (and the OS checks permissions).
+
+**Details made simple**
+| Term | Meaning |
+|------|---------|
+| **Page** | Memory is divided into small blocks (usually 4 KB) called pages, the unit that gets mapped and moved. |
+| **Page file** (`C:\pagefile.sys`) | A file on disk used as **overflow RAM**. When RAM fills up, rarely used pages are parked there. Slower than RAM. |
+| **Working set** | The pages of a process that are currently in real RAM. |
+| **Kernel space vs. user space** | Each process's address range is split: the lower half is its private **user space**; the upper half is **kernel space**, shared and off-limits to normal programs. |
+| **Shared memory** | A deliberate way for processes to share a block, when both agree. |
+| **NX / DEP** (No-eXecute / Data Execution Prevention) | Marks data areas as "can't run code from here", so injected attack code stored in data can't execute. |
+| **ASLR** (Address Space Layout Randomization) | Loads programs at randomised addresses each boot so attackers can't predict where things are. 🏠 Like shuffling the locker numbers every day. |
+
+🔍 **Why it matters:** The isolation walls are what *process injection* and *credential dumping* attacks try to break through, usually by obtaining powerful permissions ("privileges", Section 3.2). Security tools watch for programs reaching into other programs' memory.
+
+---
+
+## 2.4 DLLs (Dynamic Link Libraries)
+
+### What is a DLL?
+A **DLL** (Dynamic Link Library, file extension `.dll`) is a file of **reusable code** that many programs can borrow while they run, instead of each program carrying its own copy.
+
+🏠 **Analogy:** a shared **toolbox** in the neighbourhood. Instead of every house buying its own power drill, everyone borrows from the shared toolbox. Saves space, and if the drill is upgraded, everyone benefits.
+
+**Examples**
+- `kernel32.dll`: basic Windows functions (files, memory).
+- `user32.dll`: windows, buttons, mouse input.
+- `ntdll.dll`: the lowest-level doorway into the kernel.
+- `advapi32.dll`: registry and security functions.
+
+**Key facts**
+- When a program starts, Windows' **loader** (the part that brings a program into memory) opens each DLL it needs and **maps** it into the program's memory.
+- DLLs are **shared** to save memory: one copy of the read-only code can be used by many processes.
+- ⚠️ **A DLL's code runs *inside* the program that loaded it, with that program's permissions.** If a trusted program with high privileges loads a bad DLL, the bad code gets those high privileges.
+
+### How does a program find a DLL? (the "search order")
+If an app asks for `helper.dll` without giving the exact full path, Windows looks in a **fixed order** of places. Simplified:
+
+1. **KnownDLLs**: a protected list of core system DLLs that always load from System32 (safe).
+2. The **folder the application itself lives in**.
+3. `C:\Windows\System32`.
+4. `C:\Windows\System` and `C:\Windows`.
+5. The **current working directory** (the folder you're "standing in").
+6. Folders listed in the **PATH** (a setting listing folders where programs are looked up).
+
+### What is DLL hijacking?
+**DLL hijacking** (also called DLL planting or DLL side-loading) is when an attacker tricks a legitimate program into loading **their fake DLL** instead of the real one. They do it by putting a malicious DLL with the *expected name* into a folder that Windows searches **earlier** than the real location.
+
+🏠 **Analogy:** You send an assistant to "grab the stapler from the supply cabinet". A prankster puts a **fake stapler** on your assistant's own desk, which they check first. The assistant uses it without suspecting.
+
+**Why attackers like it**
+- The program is **trusted and often digitally signed**, so security tools see "legitimate program running".
+- It can run at a **higher privilege** than the attacker had: if a service running as SYSTEM loads a DLL from a folder an ordinary user can write to, the attacker gains SYSTEM.
+
+**Variants (plain English)**
+| Name | What happens |
+|------|--------------|
+| **Search-order hijack** | Fake DLL placed earlier in the search list. |
+| **Phantom DLL** | The program asks for a DLL that **doesn't exist anywhere**; the attacker simply supplies it. |
+| **Side-loading** | Attacker ships a *real signed program* together with their fake DLL in the same folder. |
+| **Proxying** | The fake DLL *forwards* everything to the real DLL so the program keeps working normally while the attacker's code also runs. |
+
+**How defenders spot and prevent it**
+- Use **Process Monitor** (a Sysinternals tool that records every file/registry action) to find "NAME NOT FOUND" DLL lookups.
+- In Process Explorer, look for **unsigned DLLs** or DLLs from odd folders like `Temp`.
+- Install software only in `Program Files` (regular users can't write there).
+- Programs should load DLLs using **full paths**.
+- Tools like **WDAC/AppLocker** (allow-list systems that only permit approved code) can block unapproved DLLs.
+
+---
+
+# 3. Identity, Authentication, and Access Control
+
+> **The big picture:** Windows must answer three questions. **Who are you?** (Identity and **Authentication**.) **What are you allowed to do?** (**Authorization**.) **Can I prove it later?** (Auditing/logs.)
+
+## 3.1 Security Identifiers (SIDs)
+
+Humans use **usernames** like "Maria". Windows doesn't. Under the hood, every user, group, and computer account gets a unique **SID** (**Security IDentifier**): a long, unique code.
+
+```
+S-1-5-21-1004336348-1177238915-682003330-1001
+```
+
+🏠 **Analogy:** Your name is "Maria Gomez", but the government knows you by a **national ID number**. If you change your name, the number stays the same, and so do all your records.
+
+**Why not just use names?** Names can be changed or duplicated. If an admin deletes the account "Maria" and later creates another "Maria", the new person must **not** inherit the old person's access. SIDs are *never reused*, so they don't.
+
+### How to read a SID
+```
+S - 1 - 5 - 21-1004336348-1177238915-682003330 - 1001
+│   │   │   └────── "domain/computer" ID ───────┘   └─ RID
+│   │   └ Who issued it (5 = Windows NT Authority)
+│   └ Version number (always 1)
+└ Just means "this is a SID"
+```
+The final number is the **RID** (**Relative IDentifier**): this account's number *within* that computer/domain. (A **domain** is a group of computers and users managed together by a central server, common in companies.)
+
+### Well-known SIDs and RIDs
+
+| What | SID / RID | Meaning |
+|------|-----------|---------|
+| **Administrator** account | RID **500** | The original built-in all-powerful account. (It can be renamed, but the number 500 stays.) |
+| **Guest** | RID 501 | Limited visitor account. |
+| Your first created account | RID 1000+ | Accounts you create start at 1000. |
+| **Everyone** | `S-1-1-0` | Literally every user. |
+| **LocalSystem / SYSTEM** | `S-1-5-18` | Windows' own supreme internal identity (more powerful than a regular admin). |
+| LocalService | `S-1-5-19` | Low-power service identity. |
+| NetworkService | `S-1-5-20` | Low-power service identity that can use the network. |
+| **Administrators** group | `S-1-5-32-544` | Everyone in the admin club. |
+| **Users** group | `S-1-5-32-545` | Normal users. |
+
+### Try it
+```cmd
+whoami /user       :: shows YOUR username and SID
+whoami /groups     :: shows every group you're in
+```
+
+---
+
+## 3.2 Access Tokens
+
+### What is an access token?
+When you log in, Windows (via `lsass.exe`) creates an **access token**: a small digital record of *who you are and what you may do*. Every program you start gets a **copy** of it.
+
+🏠 **Analogy: a digital VIP badge** worn by each program. It carries: your name (SID), the groups you belong to, special powers you hold (privileges), and your trust level (integrity level). Whenever the program tries to open a door (a file, a setting), the security guard checks the badge. No one asks for your password again.
+
+### What's inside the badge?
+| Field | Meaning |
+|-------|---------|
+| **User SID** | Who you are. |
+| **Group SIDs** | Which groups you're in (Administrators, Users...). Permissions are often given to groups, not individuals. |
+| **Privileges** | Special system-wide powers (below). |
+| **Integrity level** | How trusted the program is (below). |
+| **Logon session ID** | Which login this badge belongs to. |
+
+### Inheritance: where does a program's badge come from?
+When a program starts another, the **child gets a copy of the parent's token**. So a command window opened from an *administrator* program is also an administrator. This is why **who launched what** matters during an investigation.
+
+### Privileges: special powers
+A **privilege** is a **special right to do a system-wide action**, not tied to any single file. Privileges can **override normal permission rules**. Check yours with `whoami /priv`.
+
+| Privilege | What it lets you do | Why it's dangerous |
+|-----------|---------------------|--------------------|
+| **`SeDebugPrivilege`** ("Debug programs") | Open **any** process, even system ones, and read/modify its memory | Lets an attacker **dump LSASS memory** to steal passwords, or inject code into other processes. Administrators have it by default. |
+| `SeBackupPrivilege` | Read **any** file, ignoring permissions | Copy sensitive files like the registry's SAM |
+| `SeRestorePrivilege` | Write **any** file, ignoring permissions | Replace system files |
+| `SeTakeOwnershipPrivilege` | Take ownership of any object | Then rewrite its permissions |
+| `SeLoadDriverPrivilege` | Load drivers into the kernel | Run code in kernel mode |
+| `SeImpersonatePrivilege` | Temporarily act as another user | Famous "Potato" attacks abuse this to become SYSTEM |
+
+Privileges listed as "Disabled" are not gone: the program can switch them on. Only privileges *missing* from the list are unavailable.
+
+### Integrity levels: trust labels
+An **integrity level** is a label saying how much Windows trusts a process. A lower-trust process is **blocked from modifying** things of higher trust, even if normal permissions would allow it. This is the "no write up" rule.
+
+| Level | Who gets it | Plain English |
+|-------|-------------|---------------|
+| **Low** | Web browser tabs, downloaded content, sandboxed apps | "Visitor": most restricted |
+| **Medium** | Normal apps run by normal users | "Employee" |
+| **High** | Programs run **as administrator** (after clicking "Yes" on the UAC prompt) | "Manager" |
+| **System** | Core Windows services | "Owner" |
+
+🏠 **Analogy:** colour-coded wristbands at a festival. A "Visitor" wristband can't enter the staff area, even if no one specifically banned you.
+
+### UAC (User Account Control)
+**UAC** is the prompt that asks "Do you want to allow this app to make changes?" Administrators actually get **two tokens**: a normal-powered **Medium** token for everyday use, and a full **High** token that is only used when you approve the prompt. That way, a random program you open doesn't automatically have full power.
+
+🔍 **Why it matters:** the token says what an attacker who takes over a process can do. A hijacked low-integrity browser tab is far less dangerous than a hijacked SYSTEM process.
+
+---
+
+## 3.3 Authentication vs. Authorization
+
+| | **Authentication** | **Authorization** |
+|--|--------------------|-------------------|
+| Question | **Who are you?** | **What are you allowed to touch?** |
+| Happens | At login / when connecting to a service | Every time you try to open something |
+| Example | Typing your password | Windows deciding if you may read `Payroll.xlsx` |
+| Windows mechanisms | NTLM, Kerberos | DACLs / ACLs |
+
+🏠 **Analogy:** At an office building, **authentication** is showing your ID at the front desk. **Authorization** is whether your badge opens the server room door.
+
+### 3.3.1 Authentication: how Windows checks who you are
+
+First, some words:
+- A **password hash** is a scrambled fingerprint made from your password using a one-way mathematical recipe. You can't turn it back into the password, but the same password always gives the same hash. Windows stores hashes, not actual passwords. For Windows, the **NT hash** is the fingerprint.
+- A **protocol** is an agreed set of steps two computers follow to talk.
+
+#### NTLM (NT LAN Manager): the older method
+NTLM uses **challenge-response**:
+
+```
+You:     "Hi, I'd like to log in as Maria."
+Server:  "Prove it. Here's a random number (the CHALLENGE): 8f3a..."
+You:     (mix the challenge with your password hash → RESPONSE)  "Here: c91d..."
+Server:  (checks the response, via a domain controller if needed) "Correct. Welcome."
+```
+Your password never travels over the network, only the *response* does.
+
+🏠 **Analogy:** a bank asking you to sign a new random number each time, rather than reading out your PIN.
+
+**Weaknesses:**
+| Problem | What it means |
+|---------|----------------|
+| **Pass-the-Hash (PtH)** | Since the response is built from the **hash**, someone who *steals your hash* can log in **without ever knowing your password**. The hash is as good as the password itself. |
+| **Relay attacks** | An attacker in the middle forwards your login proof to another server and impersonates you. |
+| **Easy to crack** | The hash is "unsalted" (no random extra ingredient), so attackers with powerful computers can guess passwords quickly. |
+| **No mutual proof** | The server doesn't prove its identity to you. |
+
+#### Kerberos: the modern method
+**Kerberos** (named after the three-headed dog from Greek mythology) is the default in company networks (domains). It uses **tickets** from a trusted central authority instead of repeating password checks everywhere.
+
+- **KDC** (**Key Distribution Center**): the trusted ticket office. It runs on the **domain controller** (the main server managing the company's accounts).
+- **TGT** (**Ticket Granting Ticket**): your "all-day pass", proving you've already logged in.
+- **TGS ticket / Service ticket**: a specific entry ticket for **one** service (like a file server).
+
+🏠 **Analogy: a theme park.** At the entrance (**KDC**) you show your ID once and get a wristband (**TGT**). Then for each ride (service) you exchange your wristband at the ride-ticket booth for a **ride ticket** (service ticket). The ride operator only checks the ride ticket, and never needs to see your ID.
+
+```
+1. You → KDC:   "I'm Maria" (prove it with your password-based key)
+2. KDC → You:   TGT (your all-day pass)
+3. You → KDC:   "Here's my TGT, I want to use the FILESERVER."
+4. KDC → You:   Service ticket for FILESERVER
+5. You → FILESERVER: "Here's my ticket."  → Access begins.
+```
+Benefits: the password isn't sent for every access, tickets expire (typically ~10 hours), and the server can prove *its* identity to you too.
+
+| | NTLM | Kerberos |
+|--|------|----------|
+| Style | Challenge-response | Tickets from a trusted authority |
+| Age | Older | Newer, preferred |
+| Needs a domain? | No | Normally yes |
+| Famous attack | Pass-the-Hash | Kerberoasting / forged "Golden" tickets |
+
+### 3.3.2 Authorization: what you may touch (DACLs & ACLs)
+
+Every securable thing (file, folder, registry key, printer) has a **security descriptor**: a small attached record of its security settings. Key parts:
+
+- **Owner**: who owns the object.
+- **DACL** (**Discretionary Access Control List**): the list of *who may do what*.
+- **SACL** (System Access Control List): the list of what should be **logged** (audited).
+
+An **ACL** (Access Control List) is simply a list of rules attached to the thing. Each rule is an **ACE** (**Access Control Entry**) containing: *Allow or Deny*, *which SID* (user or group), and *which rights* (read, write, delete...).
+
+🏠 **Analogy:** the guest list at a private party. The doorman reads each line: "Maria: allowed in, may use the pool. Interns: denied. Staff group: allowed."
+
+**Example DACL on `Payroll.xlsx`:**
+| # | Who | Allow/Deny | Rights |
+|---|-----|-----------|--------|
+| 1 | Interns (group) | **Deny** | Write |
+| 2 | Finance (group) | Allow | Modify |
+| 3 | Administrators | Allow | Full Control |
+
+**How the decision works (simplified):**
+1. Windows looks at your **token** (SID + groups).
+2. It reads the DACL **top to bottom**.
+3. A matching **Deny** stops access for that right.
+4. **Allow** rights from all your matching groups **add up**.
+5. If no rule grants what you need, access is denied (**default deny**).
+6. **Special case:** no DACL at all = *everyone gets full access* (dangerous!). An **empty** DACL = nobody gets access.
+
+**Inheritance of permissions:** a folder's permissions are normally **passed down** to everything inside it (**inheritance**), so you don't have to set them file by file. Inherited rules appear greyed out. You can break inheritance for special cases.
+
+**Common permission levels:** Full control · Modify · Read & execute · Read · Write.
+
+**Shares vs. NTFS:** over a network, the stricter of the *share* permission and the *NTFS* (file-level) permission wins.
+
+```powershell
+icacls C:\Data                                    # view permissions on a folder
+(Get-Acl C:\Data).Access | Format-Table IdentityReference, FileSystemRights, AccessControlType
+```
+
+🔍 **Why it matters:** many attacks that raise an attacker's power ("privilege escalation") work simply because of **mistakes in permissions**, such as a folder holding a service's program that ordinary users can write to.
+
+---
+
+# 4. Networking and Service Architecture
+
+## 4.1 Windows Services (`services.exe`)
+
+### What is a service?
+A **service** is a program that runs **in the background** with **no window** and usually **starts automatically when the computer boots**, even before anyone logs in. Examples: the print queue, the antivirus engine, the Windows Update service, and the clock-sync service.
+
+### Services vs. apps with windows
+| | **Normal app** (e.g., Notepad, Chrome) | **Service** |
+|--|----------------------------------------|-------------|
+| Has a window you see? | Yes | No |
+| Starts when? | When *you* open it | Often at boot, automatically |
+| Runs when nobody's logged in? | No | Yes |
+| Runs as | You | Often a special system account |
+| Lives in | Your session (Session 1+) | Session 0 (the background workspace) |
+| Managed by | You (double-click, close) | **Service Control Manager** |
+
+🏠 **Analogy:** apps are **customers** in a shop; services are the **staff behind the scenes** (security, cleaners, stock-takers) working whether or not customers are present.
+
+### The Service Control Manager (SCM)
+`services.exe` is the **Service Control Manager**, the *supervisor of all services*. It:
+- reads the list of services from the registry (`HKLM\SYSTEM\CurrentControlSet\Services`),
+- starts them in the right order at boot,
+- starts, stops, and restarts them when asked (by tools like `services.msc`, or `sc.exe`),
+- restarts them automatically if they crash (if configured).
+
+Many services share a container program called **`svchost.exe`** ("Service Host") to save memory. Each host's command line includes `-k <groupname>`.
+
+### Startup types
+| Startup type | Meaning |
+|--------------|---------|
+| **Automatic** | Starts at boot. |
+| **Automatic (Delayed Start)** | Starts shortly *after* boot to make startup feel faster. |
+| **Manual** | Starts only when something asks for it. |
+| **Disabled** | Cannot start. (Great for turning off things you don't need.) |
+
+### Service accounts: "who does this service run as?"
+A **security context** is the identity (and therefore the permissions) a program runs under. Services typically use special built-in accounts:
+
+| Account | Power level | Network identity | Plain English |
+|---------|-------------|------------------|----------------|
+| **LocalSystem** (`SYSTEM`) | **Highest.** More power than an administrator on that computer | Acts as the computer itself on the network | The "master key". Used by core Windows pieces and security software. Dangerous if hijacked. |
+| **LocalService** | **Low** (like a restricted user) | Anonymous on the network | A minimal-badge worker; needs no network credentials. |
+| **NetworkService** | **Low** | Acts as the computer on the network | Minimal-badge worker that can reach network resources. |
+| **Virtual accounts** (`NT SERVICE\name`) | Low, one per service | Computer identity | Each service gets its own isolated "mini-account". |
+| **gMSA** (group Managed Service Account) | Custom, minimal | Its own | Domain-managed account with **automatic password rotation**: the best practice for company services. |
+
+🏠 **Analogy:** LocalSystem is the **building's master key**. LocalService and NetworkService are **janitor keys** that open only certain doors. Giving a service the master key when it only needs a janitor key is a security risk, known as violating **least privilege** (give only the minimum rights needed).
+
+🔍 **Why it matters (attacks to know):**
+- **Unquoted service path:** if a service's path contains spaces and isn't wrapped in quotes (e.g., `C:\Program Files\My App\svc.exe`), Windows may try `C:\Program.exe` first; an attacker who plants that file runs code as the service's account.
+- **Weak permissions** on a service or its program file.
+- **Malicious new services:** attackers install a service to persist. Event ID **7045** (in the System log) records every new service installation.
+
+```powershell
+Get-Service | Where Status -eq Running
+Get-CimInstance Win32_Service | Select Name, StartMode, StartName, PathName
+```
+
+---
+
+## 4.2 The Windows Networking Stack & Firewall
+
+### Networking basics
+A **network** is computers connected so they can exchange data. Key words:
+| Term | Meaning |
+|------|---------|
+| **IP address** | A computer's "street address" on a network (e.g., `192.168.1.25`). |
+| **Port** | A numbered "door" on a computer for a specific kind of traffic (e.g., port 80/443 = web; 445 = file sharing; 3389 = Remote Desktop). Think apartment numbers within the building. |
+| **Protocol** | The agreed language (TCP, UDP, HTTP...). |
+| **DNS** | The internet's phone book: turns names (`example.com`) into IP addresses. |
+| **Packet** | A small chunk that data is broken into for travel. |
+
+### The "stack" (layers)
+The **networking stack** is the layered set of components that move data from an app to the network cable/Wi-Fi and back:
+
+```
+Your app (browser)
+   ↓  uses "Winsock" (the interface apps use to open network connections)
+TCP/IP driver (tcpip.sys): does addressing, routing, and reliable delivery
+   ↓  Windows Filtering Platform (WFP): the checkpoint where firewall rules inspect traffic
+NDIS drivers (the translator for network cards)
+   ↓
+Your network card → the network
+```
+
+### What is a firewall?
+A **firewall** is a security guard for network traffic. It decides which connections are allowed in and out of a computer (or network) based on rules.
+
+🏠 **Analogy:** the **security desk at an apartment building**. It checks who's coming in, who's going out, which floor they want (the port), and whether a resident invited them.
+
+**Windows Defender Firewall** is built into Windows and is **stateful**: it remembers connections. If *you* start a connection to a website, it automatically allows the website's replies back in. But if a stranger starts a connection to you out of the blue, it blocks it unless a rule permits.
+
+**Default behaviour:**
+- **Inbound** (coming in): **blocked** unless a rule allows it.
+- **Outbound** (going out): **allowed** unless a rule blocks it.
+
+**Rules** specify: direction (in/out), allow or block, which program, which protocol/port, which addresses, and which profile.
+
+### The three network profiles
+Windows automatically applies different firewall settings depending on **where you are connected**:
+
+| Profile | When it's used | How strict | Example |
+|---------|---------------|-----------|---------|
+| **Domain** | The computer can reach its company's domain controller | Set by the company's IT admin | Your work laptop at the office |
+| **Private** | A network *you* trust | Moderate: file/printer sharing can be allowed | Your home Wi-Fi |
+| **Public** | Any unknown network; **the default for new networks** | **Strictest**: hides your computer and blocks most incoming traffic | Airport or café Wi-Fi |
+
+🏠 **Analogy:** at home you leave the front door unlocked for family (Private); at the office you follow the company's security policy (Domain); on the street you lock everything (Public).
+
+```powershell
+Get-NetFirewallProfile | Select Name, Enabled, DefaultInboundAction
+Get-NetTCPConnection -State Listen      # which ports is this PC "listening" on (doors open)?
+```
+Firewall logs: `C:\Windows\System32\LogFiles\Firewall\pfirewall.log` (if enabled).
+
+🔍 **Why it matters:** Attackers often turn off the firewall or add rules to allow remote control. Admins check that it's enabled for all three profiles and that unnecessary open ports are closed.
+
+---
+
+## 4.3 Inter-Process Communication (IPC)
+
+**IPC** (**Inter-Process Communication**) is any way for **separate programs (processes) to talk to each other**. Since processes are isolated from one another (Section 2.3), they need approved channels, like **walkie-talkies**.
+
+### Named Pipes
+A **named pipe** is a communication channel with a **name**, like a private two-way tube between programs. One program creates the pipe; another connects by name, and they pass messages back and forth.
+- Names look like `\\.\pipe\mypipe` (the `.` means "this computer"). Across a network: `\\ServerName\pipe\mypipe`.
+- Pipes have **permissions** (ACLs) like files do.
+- Over a network, pipes travel over the file-sharing system (**SMB**, Server Message Block, port 445).
+
+🏠 **Analogy:** a **pneumatic tube** system in a bank: you put a message in a capsule at one end, and a teller at the other end reads and replies.
+
+### RPC (Remote Procedure Call)
+**RPC** lets one program **call a function in another program as if it were its own**, even if that other program is on a *different computer*. You send a request ("please do task X with these details"), and you get a reply back.
+
+🏠 **Analogy:** a **walkie-talkie** conversation with a service desk: "Please start the print service on that computer." "Done."
+
+- Windows uses RPC *everywhere* for admin tasks (managing services remotely, scheduled tasks, remote registry, domain management).
+- An **Endpoint Mapper** (on TCP port **135**) acts as a receptionist: it tells callers which door (port) the service they want is listening on. Those are usually high-numbered ports (49152-65535).
+- **ALPC** is a fast version for talking between programs on the *same* computer.
+
+### Why this matters for security
+Many **lateral movement** techniques (attackers jumping from one computer to the next) travel through named pipes and RPC. Examples:
+- **PsExec**, a legit admin tool also abused by attackers: creates a service on a remote machine through RPC/named pipes.
+- Remote scheduled tasks, WMI (Windows Management Instrumentation, a framework for managing computers), and many others.
+
+Defenders watch for unusual pipe names and unexpected remote service creation, and restrict who can reach ports 135/445 using firewalls.
+
+```powershell
+[System.IO.Directory]::GetFiles("\\.\pipe\")     # list the pipes that exist on this computer
+```
+
+---
+
+# 5. Windows Administrative & Triage Tools
+
+**Triage** (from hospital emergency rooms) means a fast first look to decide what's wrong and what to do first. These tools let you look inside a running Windows system.
+
+## 5.1 Task Manager
+
+Open with **Ctrl+Shift+Esc**.
+
+| Tab | What it shows |
+|-----|---------------|
+| **Processes** | Running apps and background processes with CPU, memory, disk, network use. |
+| **Performance** | Live graphs for CPU, RAM, disk, network. |
+| **Startup apps** | Programs that launch at login (you can disable them). |
+| **Users** | Who's logged in and their resource use. |
+| **Details** | The detailed list: **PID**, user name, status. *Tip:* right-click the column header → **Select columns** → add **Command line** and **Image path name**. |
+| **Services** | List of services with their PIDs. |
+
+**Limits:** it doesn't show parent-child relationships, loaded DLLs, or open handles, and it doesn't check digital signatures. That's why we move up to better tools.
+
+## 5.2 Resource Monitor
+
+Open with **Win+R → `resmon`**. It shows **live detail about what each program is doing**:
+- **CPU:** threads and modules in use.
+- **Memory:** how much RAM each process uses.
+- **Disk:** exactly which files are being read/written right now.
+- **Network:** which programs are talking over the network, their **listening ports**, and the **remote IP addresses** they're connected to.
+
+Handy question it answers: *"Which program is using this port?"* or *"Which program has this file locked?"* (use the *Associated Handles* search box in the CPU tab).
+
+## 5.3 Process Explorer & Process Hacker (the investigator's tools)
+
+**Process Explorer** (free, from Microsoft's **Sysinternals** collection: a set of professional-grade free tools) is Task Manager's powerful big sibling. **Process Hacker** (now called **System Informer**) is a similar open-source tool.
+
+### Reading the process tree
+A **process tree** shows parent processes with their children indented below them, like a family tree.
+```
+wininit.exe
+├─ services.exe
+│   ├─ svchost.exe -k ...
+│   └─ svchost.exe -k ...
+└─ lsass.exe
+explorer.exe
+├─ chrome.exe
+└─ notepad.exe
+```
+- Compare what you see to the **baseline table in Section 2.2**.
+- Processes without parents appear at the top level (normal for `csrss`, `wininit`, `winlogon`, `explorer`).
+- **Suspicious tree example:** `winword.exe → cmd.exe → powershell.exe` (a Word document launching command shells). A normal user doesn't do this!
+
+### Handy columns (right-click header → Select Columns)
+**Image Path · Command Line · Verified Signer · User Name · Integrity Level · Session · Start Time**
+
+### Colour hints (default)
+- **Blue:** processes run by *you*.
+- **Pink:** services.
+- **Purple:** "packed" files (compressed/obfuscated: sometimes legitimate, sometimes used to hide malware).
+
+### The lower pane: DLLs and Handles
+Toggle with **Ctrl+L** (show lower pane), and **Ctrl+D** (DLL view) or **Ctrl+H** (Handle view).
+- **DLL view** lists every DLL a process has loaded, with its path and publisher. *Look for:* unsigned DLLs; DLLs in odd places like `Temp`.
+- **Handle view** lists everything the process has "open": files, registry keys, other processes, **mutexes** (named flags that programs use to say "I'm already running", which malware sometimes uses so it doesn't run twice), and named pipes.
+- **Search** (Ctrl+F) answers: "Which process has this file/DLL open?"
+
+### Double-click a process → Properties
+- **Image tab:** full path, command line, **parent**, user, start time, and a **Verify** button to check the digital signature.
+- **TCP/IP tab:** its network connections.
+- **Threads tab:** its workers.
+- **Strings tab:** readable text inside it.
+- **Security tab:** its token groups and privileges.
+
+**Settings worth turning on:** *Options → Verify Image Signatures*, *Options → VirusTotal.com → Check VirusTotal.com* (compares file fingerprints against an online malware database; this shares only the hash, not your files).
+
+### A simple triage routine
+1. Does each core process (Section 2.2) have the right **path, parent, user, and count**?
+2. Anything **unsigned**, with a **strange name**, or running from **Temp/Downloads/AppData**?
+3. Is a harmless-looking program (Notepad, Calculator) connecting to the internet?
+4. Does the **command line** look weird (very long, scrambled text, `-enc`, a web address)?
+5. Anything odd among **DLLs/handles**?
+6. Cross-check with **Autoruns** (below) and **Event Viewer**.
+
+## 5.4 Autoruns: Finding Auto-Start Points
+
+An **auto-start point** (or **ASEP**, Auto-Start Extensibility Point) is *any place Windows is told to launch something automatically*. **Autoruns** (from Sysinternals) lists **all** of them, which is far more than Task Manager's Startup tab.
+
+🏠 **Analogy:** Task Manager shows you the **front door** and **back door** to the house. Autoruns shows you **every window, vent, and secret passage**.
+
+**What it covers (main tabs):**
+| Tab | Plain English |
+|-----|---------------|
+| **Logon** | Run keys and Startup folders: programs launching when you log in. |
+| **Scheduled Tasks** | Jobs set to run at certain times or events (a favourite hiding place for malware). |
+| **Services** | Background services. |
+| **Drivers** | Kernel drivers. |
+| **Explorer** | Add-ons loaded into your desktop shell. |
+| **Image Hijacks / AppInit / Winlogon** | Special registry tricks that launch code. |
+| **WMI** | Hidden event-triggered launches. |
+
+**How to use it well:**
+1. Turn on **Options → Hide Microsoft Entries** (reduces noise) and **Verify Code Signatures**.
+2. Look at what's left: **unsigned items**, entries with **no publisher/description**, and **paths in user folders** (`AppData`, `Temp`, `ProgramData`).
+3. Pink "file not found" lines can be leftovers of removed software, or hijack opportunities.
+4. **Save a clean baseline** (File → Save), then later **Compare** to see what changed.
+5. To be safe, **untick** (disable) instead of deleting, so you can undo it.
+
+## 5.5 Event Viewer: The System's Official Diary
+
+**Event Viewer** (open with Win+R → `eventvwr.msc`) shows the **event logs**: records where Windows and programs write down what happened and when. Each entry is an **event**, with a number called an **Event ID** that identifies the *kind* of event (like a chapter number in a diary).
+
+🏠 **Analogy:** a **ship's logbook** or CCTV for the computer: it doesn't stop incidents, but it lets you reconstruct them afterwards.
+
+### The three classic logs (under "Windows Logs")
+| Log | What it records |
+|-----|-----------------|
+| **Application** | Events from programs (crashes, errors). |
+| **Security** | Logins, permission checks, account changes: the "who did what" log. (Many items must be switched on through **audit policy**: settings that choose what gets recorded.) |
+| **System** | Windows' own events: drivers, services starting/stopping, shutdowns. |
+
+Other logs live under **Applications and Services Logs** (e.g., PowerShell, Windows Defender, Task Scheduler).
+
+### Event IDs worth knowing
+| Event ID | Log | Meaning |
+|----------|-----|---------|
+| **4624** | Security | Someone **logged on successfully** |
+| **4625** | Security | A **failed** login attempt (many in a row may mean password guessing) |
+| 4634 / 4647 | Security | Logoff |
+| **4672** | Security | A login received **special privileges** (admin-like) |
+| **4688** | Security | A **new process** was created |
+| **4720** | Security | A **new user account** was created |
+| 4732 | Security | Someone was added to a security group (e.g., Administrators) |
+| **1102** | Security | The **Security log was cleared** (suspicious!) |
+| **7045** | System | A **new service** was installed |
+| 6005 / 6006 | System | Event log started / stopped (≈ computer boot / shutdown) |
+| 41 | System | Unexpected restart/crash |
+
+**Logon types** (inside 4624/4625) tell *how* someone logged in: **2** = at the keyboard, **3** = over the network (e.g., file share), **10** = Remote Desktop, **5** = a service.
+
+### Reading an event
+Each event has a **General** tab (readable summary), a **Details** tab (every field), plus **Time**, **Source**, and **Event ID**. Use **Filter Current Log** (right pane) to show only certain Event IDs or time ranges.
+
+```powershell
+Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4625} -MaxEvents 10     # last 10 failed logins
+Get-WinEvent -FilterHashtable @{LogName='System'; Id=7045}                      # new services
+```
+Log files live in `C:\Windows\System32\winevt\Logs\` (extension `.evtx`).
+
+### Beyond the basics (just a taste)
+- **PowerShell:** Windows' powerful command-line and scripting tool. It passes **objects** (structured data with named properties) between commands, rather than plain text, which makes it easy to filter and sort. **Script Block Logging** (Event ID **4104**) records the actual PowerShell code that ran, even if it was scrambled.
+- **Sysmon** (System Monitor): a free Sysinternals add-on that logs much richer detail (every process start with its command line and parent, network connections, file/registry changes, DLL loads) to its own log.
+
+🔍 **Why it matters:** Attackers sometimes clear logs (Event 1102) to hide. Organisations send logs to a separate safe place (a **SIEM**, Security Information and Event Management system) so evidence survives.
+
+---
+
+# 6. Glossary (A-Z)
+
+| Term | Plain-English meaning |
+|------|----------------------|
+| **ACE / ACL / DACL / SACL** | A single rule / a list of rules / the list of who may access / the list of what to audit. |
+| **Access token** | Your "digital VIP badge": identity, groups, privileges, trust level. |
+| **Authentication** | Proving who you are. |
+| **Authorization** | Deciding what you're allowed to do. |
+| **Autoruns** | Sysinternals tool that lists everything that starts automatically. |
+| **Baseline** | A description of what "normal" looks like. |
+| **BCD** | Boot Configuration Data: settings the Boot Manager reads. |
+| **BitLocker** | Windows' disk encryption. |
+| **Boot / booting** | Starting a computer up. |
+| **Child / parent process** | The process that was started / the one that started it. |
+| **Context switch** | The CPU pausing one thread and resuming another. |
+| **CPU** | The computer's brain. |
+| **DLL** | Dynamic Link Library: shared code file. |
+| **DLL hijacking** | Tricking a program into loading an attacker's DLL. |
+| **Domain / Domain controller** | A company-managed group of computers / the server managing it. |
+| **Driver** | Translator software between Windows and hardware. |
+| **Event ID** | A number identifying the kind of log event. |
+| **Firewall** | A guard that allows or blocks network traffic by rules. |
+| **Firmware** | Permanent starter software on the motherboard. |
+| **GPT / MBR** | Modern / old disk-layout formats. |
+| **Handle** | A "ticket" a process holds to use an open resource. |
+| **Hash** | A one-way scrambled fingerprint of data. |
+| **HKLM / HKCU** | Registry sections for the whole computer / the current user. |
+| **Integrity level** | Trust label: Low, Medium, High, System. |
+| **IPC** | Inter-Process Communication: how programs talk. |
+| **Kerberos** | Ticket-based authentication used in domains. |
+| **Kernel** | The core of the OS (`ntoskrnl.exe`). |
+| **KDC / TGT** | Kerberos ticket office / your all-day pass. |
+| **lsass.exe** | The security guard process that checks logins. |
+| **Named pipe** | A named two-way message tube between programs. |
+| **NTFS** | Windows' file system, with permissions support. |
+| **NTLM** | Older challenge-response authentication. |
+| **Pass-the-Hash** | Logging in using a stolen hash instead of a password. |
+| **PID** | Process ID number. |
+| **Privilege** | A special system-wide power (like `SeDebugPrivilege`). |
+| **Process / Thread** | A running program's workspace / the workers inside it. |
+| **Registry** | The central database of settings. |
+| **RID** | The last number in a SID; Administrator = 500. |
+| **RPC** | Remote Procedure Call: asking another program to run a function. |
+| **Scheduler** | Decides which thread runs next. |
+| **Secure Boot** | UEFI feature that only lets trusted, signed code start. |
+| **Service** | Background program with no window. |
+| **Session** | An isolated workspace for a login (Session 0 = system). |
+| **SID** | Security Identifier: a unique number for each account/group. |
+| **System call** | A request from a program to the kernel. |
+| **TPM** | Security chip that stores keys and boot measurements. |
+| **UAC** | The "Do you want to allow this?" prompt. |
+| **UEFI / BIOS** | Modern / old firmware. |
+| **Virtual memory** | Each process gets its own private imaginary address space. |
+
+---
+
+# 7. Practice Exercises
+
+Use a **practice computer or virtual machine** (a "pretend computer" that runs inside your real one, safe to experiment on). Don't change settings on a work or personal machine you can't afford to break.
+
+1. **Boot detective:** open `msinfo32`. Is your BIOS mode UEFI or Legacy? Is Secure Boot on?
+2. **Know yourself:** run `whoami /user`, `whoami /groups`, and `whoami /priv`. What's your SID? Are you in the Administrators group? Which privileges are *Disabled*?
+3. **Registry peek:** open `regedit` (look only). Browse to `HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`. What starts when you log in?
+4. **Process family tree:** download **Process Explorer**. Find `System` (PID 4), `smss.exe`, `wininit.exe`, `services.exe`, `lsass.exe`, and `explorer.exe`. For each, note the path, parent, and user. Compare with the table in Section 2.2.
+5. **Spot the fake:** make a copy of `notepad.exe` into your Downloads folder, rename it `svchost.exe`, and run it. In Process Explorer, how can you tell it's fake? (Check path, parent, command line, signature.) Close it afterwards.
+6. **Open ports:** run `Get-NetTCPConnection -State Listen` in PowerShell. Which programs are listening? Match each PID using Process Explorer.
+7. **Services:** open `services.msc`. Find a service set to Automatic, double-click it, and look at the "Log On" tab. Which account does it use?
+8. **Firewall:** open *Windows Security → Firewall & network protection*. Which profile is active right now (Domain, Private, or Public)?
+9. **Autoruns:** download Autoruns, tick *Hide Microsoft Entries* and *Verify Code Signatures*. Anything unsigned? Anything with a path in `AppData`?
+10. **Event diary:** open Event Viewer → Windows Logs → Security. Use *Filter Current Log* for Event ID **4624**. When did you last log in? Then try **4625** (failed logins): try typing a wrong password on the lock screen and see it appear.
+
+---
+
+## 🎉 You made it!
+
+You now know how Windows starts up, how it organises work into processes and threads, how it tracks identity and permissions, how services and networking fit in, and which tools let you look inside. The best way to lock this in is **to explore a practice machine with the tools above**, checking each core process against the baseline until "normal" feels familiar. Once it does, abnormal will stand out. 💪
+
+*End of beginner notes.*
